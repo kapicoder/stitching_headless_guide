@@ -18,6 +18,8 @@ GUIDED_DEFAULT_SETTINGS: dict[str, Any] = {
     key: DEFAULT_SETTINGS[key] for key in (
         "guided_min_overlap_pixels", "guided_overlap_margin_ratio",
         "guided_min_inliers", "guided_ransac_threshold_px",
+        "guided_max_translation_ratio", "guided_max_rotation_degrees",
+        "guided_max_scale_change", "guided_max_shear",
     )
 }
 
@@ -28,6 +30,8 @@ GUIDED_SETTING_KEYS = {
     "blend_strength", "crop", "guided_min_overlap_pixels",
     "guided_overlap_margin_ratio", "guided_min_inliers",
     "guided_ransac_threshold_px",
+    "guided_max_translation_ratio", "guided_max_rotation_degrees",
+    "guided_max_scale_change", "guided_max_shear",
 }
 
 
@@ -155,6 +159,10 @@ class GuidedAffineStitcher:
         guided_overlap_margin_ratio=GUIDED_DEFAULT_SETTINGS["guided_overlap_margin_ratio"],
         guided_min_inliers=GUIDED_DEFAULT_SETTINGS["guided_min_inliers"],
         guided_ransac_threshold_px=GUIDED_DEFAULT_SETTINGS["guided_ransac_threshold_px"],
+        guided_max_translation_ratio=GUIDED_DEFAULT_SETTINGS["guided_max_translation_ratio"],
+        guided_max_rotation_degrees=GUIDED_DEFAULT_SETTINGS["guided_max_rotation_degrees"],
+        guided_max_scale_change=GUIDED_DEFAULT_SETTINGS["guided_max_scale_change"],
+        guided_max_shear=GUIDED_DEFAULT_SETTINGS["guided_max_shear"],
         show_progress=True, output_path=None,
         matching_regions=None,
     ) -> None:
@@ -175,6 +183,17 @@ class GuidedAffineStitcher:
         self.ransac_threshold_px = float(guided_ransac_threshold_px)
         if not math.isfinite(self.ransac_threshold_px) or self.ransac_threshold_px <= 0:
             raise ValueError("guided_ransac_threshold_px 必须是大于0的有限数值")
+        self.refinement_limits = {
+            "translation_ratio": float(guided_max_translation_ratio),
+            "rotation_degrees": float(guided_max_rotation_degrees),
+            "scale_change": float(guided_max_scale_change),
+            "shear": float(guided_max_shear),
+        }
+        for name, value in self.refinement_limits.items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"guided_max_{name} 必须是非负的有限数值")
+        if self.refinement_limits["rotation_degrees"] > 180:
+            raise ValueError("guided_max_rotation_degrees 不能超过180度")
         self.show_progress = show_progress
         self.output_path = output_path
         self.output_offset = [0.0, 0.0]
@@ -424,6 +443,32 @@ class GuidedAffineStitcher:
                 pending.append(index)
         return connected
 
+    def _check_refinement(
+        self, linear: np.ndarray, center_shift: np.ndarray, short_side: float,
+    ) -> tuple[dict[str, float], str]:
+        """Measure the correction about the image center, not the canvas origin.
+
+        Polar decomposition separates rotation from symmetric stretch. Principal
+        stretches measure scale; normalized off-diagonal stretch measures shear.
+        """
+        u, singular, vt = np.linalg.svd(linear)
+        rotation = u @ vt
+        stretch = vt.T @ np.diag(singular) @ vt
+        metrics = {
+            "translation_ratio": float(np.linalg.norm(center_shift) / short_side),
+            "rotation_degrees": abs(math.degrees(math.atan2(rotation[1, 0], rotation[0, 0]))),
+            "scale_change": float(np.max(np.abs(singular - 1.0))),
+            "shear": float(abs(stretch[0, 1]) / math.sqrt(stretch[0, 0] * stretch[1, 1])),
+        }
+        exceeded = [name for name, value in metrics.items()
+                    if value > self.refinement_limits[name] + 1e-9]
+        labels = {"translation_ratio": "中心平移", "rotation_degrees": "旋转角度",
+                  "scale_change": "缩放", "shear": "剪切"}
+        reason = ""
+        if exceeded:
+            reason = "仿射修正超过微调上限（" + "、".join(labels[name] for name in exceeded) + "），保留人工位置"
+        return metrics, reason
+
     def _global_adjust(self, items: list[dict], pairs: list[tuple]) -> None:
         # Solve dimensionless residuals, with a weak positional prior at all four
         # corners. Its strength is independent of raw image and canvas sizes.
@@ -431,6 +476,8 @@ class GuidedAffineStitcher:
         centers = [quad.mean(axis=0) for quad in quads]
         spans = [float(np.linalg.norm(np.roll(quad, -1, axis=0) - quad, axis=1).max())
                  for quad in quads]
+        short_sides = [float(np.linalg.norm(np.roll(quad, -1, axis=0) - quad, axis=1).min())
+                       for quad in quads]
         unit = spans[0]
         excluded: set[int] = set()
         items[0]["correction_status"] = "reference"
@@ -488,7 +535,15 @@ class GuidedAffineStitcher:
                     invalid.add(index)
                     items[index]["correction_reason"] = "全局优化产生无效仿射变换，保留人工位置"
                 else:
-                    candidates[index] = matrix
+                    metrics, reason = self._check_refinement(
+                        linear, spans[index] * np.array([tx, ty]), short_sides[index],
+                    )
+                    items[index]["attempted_correction"] = metrics
+                    if reason:
+                        invalid.add(index)
+                        items[index]["correction_reason"] = reason
+                    else:
+                        candidates[index] = matrix
             if invalid:
                 excluded.update(invalid)
                 continue
@@ -503,6 +558,7 @@ class GuidedAffineStitcher:
         return {
             "registration_status": self.registration_status,
             "image_diagnostics": self.image_diagnostics,
+            "refinement_limits": self.refinement_limits,
         }
 
     @staticmethod
@@ -630,6 +686,7 @@ class GuidedAffineStitcher:
             {"image_index": index, "path": item["path"],
              "status": item["correction_status"],
              "reason": item.get("correction_reason", ""),
+             "attempted_correction": item.get("attempted_correction"),
              "initial_transform": item["initial_matrix"].tolist(),
              "final_transform": item["matrix"].tolist()}
             for index, item in enumerate(items)

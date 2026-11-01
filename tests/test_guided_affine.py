@@ -62,7 +62,7 @@ def test_weak_texture_keeps_manual_position_and_negative_offset(tmp_path):
     assert stitcher.pair_diagnostics[0]["status"] == "fallback_initial"
 
 
-def test_guided_match_supports_shear_and_nonuniform_scale(tmp_path):
+def test_guided_match_supports_shear_and_nonuniform_scale_when_limits_allow(tmp_path):
     first, second = _write_pair(tmp_path)
     images = _images(first, second, 170)
     initial = np.array([[1.2, 0.25, 170.0], [0.0, 0.8, 0.0]])
@@ -70,7 +70,10 @@ def test_guided_match_supports_shear_and_nonuniform_scale(tmp_path):
     images[1]["corners"] = (
         source_corners @ initial[:, :2].T + initial[:, 2]
     ).tolist()
-    stitcher = GuidedAffineStitcher(show_progress=False)
+    stitcher = GuidedAffineStitcher(
+        show_progress=False, guided_max_translation_ratio=0.5,
+        guided_max_rotation_degrees=15, guided_max_scale_change=0.5, guided_max_shear=0.5,
+    )
 
     items = stitcher.register(images)
 
@@ -137,12 +140,14 @@ def test_three_images_refine_through_overlap_chain(tmp_path):
     assert all(pair["status"] == "refined" for pair in stitcher.pair_diagnostics)
 
 
-def test_visual_correction_is_not_limited_by_old_pixel_cap(tmp_path):
+def test_large_visual_correction_keeps_manual_layout(tmp_path):
     first, second = _write_pair(tmp_path)
     stitcher = GuidedAffineStitcher(show_progress=False, final_megapix=-1)
     panorama = stitcher.stitch(_images(first, second, 195))
-    assert abs(panorama.shape[1] - 420) <= 2
-    assert stitcher.pair_diagnostics[0]["status"] == "refined"
+    assert panorama.shape[1] == 445
+    assert stitcher.pair_diagnostics[0]["inliers"] >= 8
+    assert stitcher.registration_status == "manual_only"
+    assert "微调上限" in stitcher.image_diagnostics[1]["reason"]
 
 
 def test_invalid_geometry_and_no_overlap(tmp_path):
@@ -179,6 +184,7 @@ def test_api_returns_compact_result_and_debug_info(tmp_path):
         "status", "output_path", "progress_path", "image_count", "valid_paths",
         "output_width", "output_height", "algorithm", "cog", "settings", "debug_info",
         "registration_status", "image_diagnostics",
+        "refinement_limits",
     }
     assert data["registration_status"] == "manual_only"
     assert data["image_diagnostics"][1]["status"] == "fallback_initial"

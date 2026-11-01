@@ -174,6 +174,14 @@ const partialDebug = sandbox.testFormatApiDebug({
 });
 assert.match(partialDebug, /部分配准/);
 assert.match(partialDebug, /图 3：保留人工位置/);
+const rejectedDebug = sandbox.testFormatApiDebug({
+  registration_status: 'manual_only',
+  image_diagnostics: [{image_index: 1, status: 'fallback_initial', reason: '仿射修正超过微调上限',
+    attempted_correction: {translation_ratio: 0.08, rotation_degrees: 0, scale_change: 0.01, shear: 0.01}}],
+  debug_info: {stages: [], timings: {}},
+});
+assert.match(rejectedDebug, /超过微调上限/);
+assert.match(rejectedDebug, /中心平移 8.00% 短边/);
 
 // File-generation success must not be presented as successful registration.
 (async () => {

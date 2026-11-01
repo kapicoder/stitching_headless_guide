@@ -86,6 +86,7 @@ def test_proxy_uses_container_paths_and_submits_four_corners(monkeypatch):
     response = _app().test_client().post("/api/stitch", json={
         "images": _positions(), "output_name": "manual_result.tif",
         "final_megapix": 2, "blender_type": "feather", "guided_ransac_threshold_px": 2.5,
+        "guided_max_translation_ratio": 0.02,
         "matching_regions": [{"id":"a", "rect":[3000,0,1000,24000]}],
     })
     assert response.status_code == 200
@@ -98,6 +99,7 @@ def test_proxy_uses_container_paths_and_submits_four_corners(monkeypatch):
     assert payload["settings"]["algorithm"] == "guided_affine"
     assert payload["settings"]["georef_mode"] == "none"
     assert payload["settings"]["guided_ransac_threshold_px"] == 2.5
+    assert payload["settings"]["guided_max_translation_ratio"] == 0.02
     assert response.get_json()["preview_url"] == "/result/manual_result.tif"
     assert response.get_json()["download_url"] == "/download/manual_result.tif"
 

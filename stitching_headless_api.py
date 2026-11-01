@@ -286,6 +286,7 @@ def _run_headless_stitch(options: Dict[str, Any]) -> Dict[str, Any]:
     if "registration_status" in result_context:
         response["registration_status"] = result_context["registration_status"]
         response["image_diagnostics"] = result_context["image_diagnostics"]
+        response["refinement_limits"] = result_context["refinement_limits"]
     return response
 
 

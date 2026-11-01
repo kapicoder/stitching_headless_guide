@@ -265,7 +265,8 @@ def create_app(
             return jsonify({"error": "结果文件名只能是 output 目录中的 JPG、PNG 或 TIFF 文件名"}), 400
         settings = {"algorithm": "guided_affine", "georef_mode": "none"}
         for key in ("final_megapix", "medium_megapix", "low_megapix", "blender_type",
-                    "guided_ransac_threshold_px"):
+                    "guided_ransac_threshold_px", "guided_max_translation_ratio",
+                    "guided_max_rotation_degrees", "guided_max_scale_change", "guided_max_shear"):
             if key in body:
                 settings[key] = body[key]
         payload = {"images": guided_images, "matching_regions": matching_regions, "output_path": f"/workspace/output/{output_name}",

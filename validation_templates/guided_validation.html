@@ -553,6 +553,8 @@
       for (const image of data.image_diagnostics || []) {
         const label = image.status === 'reference' ? '固定参考图' : image.status === 'refined' ? '精配准成功' : '保留人工位置';
         lines.push(`图 ${image.image_index+1}：${label}；${image.reason || ''}`);
+        const correction = image.attempted_correction;
+        if (correction) lines.push(`  修正尝试：中心平移 ${(100*correction.translation_ratio).toFixed(2)}% 短边；旋转 ${correction.rotation_degrees.toFixed(2)}°；缩放 ${(100*correction.scale_change).toFixed(2)}%；剪切 ${(100*correction.shear).toFixed(2)}%`);
       }
       lines.push('', '阶段进度：');
       for (const stage of info.stages || []) {

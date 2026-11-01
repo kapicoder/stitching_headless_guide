@@ -23,6 +23,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "guided_min_inliers": 8,
     # RANSAC 误差使用目标特征图像素，不使用画布单位。
     "guided_ransac_threshold_px": 3.0,
+    # 完整仿射微调上限，均相对于用户的初始布局。
+    # 平移使用图像中心位移 / 初始画布短边，旋转使用极分解角度。
+    "guided_max_translation_ratio": 0.05,
+    "guided_max_rotation_degrees": 3.0,
+    # 缩放限制极分解的两个主伸缩率，剪切为对称伸缩矩阵的归一化非对角项。
+    "guided_max_scale_change": 0.03,
+    "guided_max_shear": 0.03,
     "match_conf": 0.65,
     "confidence_threshold": 0.3,
     
@@ -193,6 +200,8 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
         "match_conf", "confidence_threshold", "medium_megapix", "low_megapix",
         "final_megapix", "apap_sigma",
         "guided_overlap_margin_ratio", "guided_ransac_threshold_px",
+        "guided_max_translation_ratio", "guided_max_rotation_degrees",
+        "guided_max_scale_change", "guided_max_shear",
     }:
         settings[key] = float(settings[key])
     settings["crop"] = _as_bool(settings["crop"])
@@ -214,6 +223,12 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if (not math.isfinite(settings["guided_ransac_threshold_px"])
             or settings["guided_ransac_threshold_px"] <= 0):
         raise ValueError("guided_ransac_threshold_px 必须是大于0的有限数值")
+    for key in ("guided_max_translation_ratio", "guided_max_rotation_degrees",
+                "guided_max_scale_change", "guided_max_shear"):
+        if not math.isfinite(settings[key]) or settings[key] < 0:
+            raise ValueError(f"{key} 必须是非负的有限数值")
+    if settings["guided_max_rotation_degrees"] > 180:
+        raise ValueError("guided_max_rotation_degrees 不能超过180度")
     if not 0 < settings["match_conf"] <= 1:
         raise ValueError("match_conf 必须大于0且小于等于1")
     if settings["range_width"] != -1 and settings["range_width"] < 1:
