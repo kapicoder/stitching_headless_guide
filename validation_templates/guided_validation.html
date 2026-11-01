@@ -565,6 +565,45 @@
         if (pair.rmse_pixels != null) lines.push(`  拟合 RMSE：${pair.rmse_pixels.toFixed(3)} 个图 ${pair.image_a+1} 的特征图像素；RANSAC 阈值：${pair.ransac_threshold_px}`);
         for (const region of pair.regions || []) lines.push(`  ${region.id || '自动区域'}：面积 ${region.area_a}/${region.area_b}；预算 ${region.budget_a}/${region.budget_b}；特征 ${region.features_a}/${region.features_b}；匹配 ${region.matches}，内点 ${region.inliers || 0}；${region.reason || ''}`);
       }
+      lines.push('', '接缝局部网格（Mesh）：');
+      const mesh = info.seam_mesh;
+      if (!mesh) {
+        lines.push('API 未返回 Mesh 诊断');
+      } else {
+        const meshStatus = {
+          applied: '已应用网格形变',
+          no_change: '求解完成，但没有产生有效位移',
+          fallback_no_seam_support: '回退：接缝支持区域不足',
+          fallback_no_movable_images: '回退：没有可变形图像',
+          fallback_mesh_too_large: '回退：网格规模超限',
+          fallback_insufficient_seam_matches: '回退：接缝匹配不足',
+          fallback_solver_failure: '回退：网格求解失败',
+          fallback_local_error: '回退：局部网格处理异常',
+          pending: '待处理',
+          disabled: '未启用',
+        }[mesh.status] || `未知状态（${mesh.status || '未返回'}）`;
+        const meshSettings = data.settings || {};
+        lines.push(`状态：${meshStatus}；启用：${mesh.enabled ? '是' : '否'}；接缝匹配：${mesh.matches_used ?? 0}；实际应用：${mesh.seam_refined ? '是' : '否'}`);
+        lines.push(`配置：网格间距 ${meshSettings.guided_mesh_grid_spacing ?? '未返回'} px；接缝带比例 ${meshSettings.guided_mesh_seam_band_ratio ?? '未返回'}；最大位移比例 ${meshSettings.guided_mesh_max_displacement_ratio ?? '未返回'}；最少匹配 ${meshSettings.guided_mesh_min_matches ?? '未返回'}`);
+        if (mesh.reason) lines.push(`原因：${mesh.reason}`);
+        for (const image of mesh.images || []) {
+          const imageStatus = {
+            fixed_reference: '固定参考图',
+            fixed_manual_position: '固定人工位置',
+            refined: '已变形',
+            no_change: '未产生有效位移',
+            fallback_insufficient_seam_matches: '回退：接缝匹配不足',
+            fallback_solver_failure: '回退：求解器失败',
+            fallback_mesh_too_large: '回退：网格规模超限',
+            fallback_local_error: '回退：局部处理异常',
+          }[image.status] || image.status || '状态未返回';
+          const displacement = Number.isFinite(image.max_displacement_pixels)
+            ? `${image.max_displacement_pixels.toFixed(3)} px` : '未返回';
+          const jacobian = Number.isFinite(image.minimum_jacobian)
+            ? `；最小 Jacobian ${image.minimum_jacobian.toFixed(4)}` : '';
+          lines.push(`图 ${image.image_index+1}：${imageStatus}；最大位移 ${displacement}；接缝支持 ${image.seam_support_pixels ?? '未返回'} px${jacobian}`);
+        }
+      }
       lines.push('', '最终阶段耗时（累计）：');
       for (const [name, timing] of Object.entries(info.timings || {})) {
         lines.push(`${name}: ${timing.total_seconds}s（${timing.count} 次）`);

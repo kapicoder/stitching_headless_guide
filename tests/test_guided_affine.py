@@ -142,7 +142,10 @@ def test_three_images_refine_through_overlap_chain(tmp_path):
 
 def test_large_visual_correction_keeps_manual_layout(tmp_path):
     first, second = _write_pair(tmp_path)
-    stitcher = GuidedAffineStitcher(show_progress=False, final_megapix=-1)
+    stitcher = GuidedAffineStitcher(
+        show_progress=False, final_megapix=-1,
+        guided_refinement_limits_enabled=True,
+    )
     panorama = stitcher.stitch(_images(first, second, 195))
     assert panorama.shape[1] == 445
     assert stitcher.pair_diagnostics[0]["inliers"] >= 8
@@ -163,7 +166,7 @@ def test_invalid_geometry_and_no_overlap(tmp_path):
     np.testing.assert_array_equal(items[1]["matrix"], items[1]["initial_matrix"])
 
 
-def test_api_returns_compact_result_and_debug_info(tmp_path):
+def test_api_returns_compact_result_and_debug_info(tmp_path, capsys):
     first, second = _write_pair(tmp_path, textured=False)
     output = tmp_path / "result.png"
     response = app.test_client().post("/stitch", json={
@@ -184,13 +187,19 @@ def test_api_returns_compact_result_and_debug_info(tmp_path):
         "status", "output_path", "progress_path", "image_count", "valid_paths",
         "output_width", "output_height", "algorithm", "cog", "settings", "debug_info",
         "registration_status", "image_diagnostics",
-        "refinement_limits",
+        "refinement_limits_enabled", "refinement_limits",
     }
     assert data["registration_status"] == "manual_only"
+    assert data["refinement_limits_enabled"] is False
     assert data["image_diagnostics"][1]["status"] == "fallback_initial"
+    assert data["debug_info"]["seam_mesh"]["enabled"] is True
+    mesh_log = capsys.readouterr().out
+    assert "[API] 接缝 Mesh 诊断 请求 #" in mesh_log
+    assert '"result":{"enabled":true' in mesh_log
     stages = data["debug_info"]["stages"]
-    assert len(stages) == 17
-    assert stages[-1]["index"] == stages[-1]["total"] == 17
+    expected_stages = 19 if data["settings"]["guided_mesh_enabled"] else 17
+    assert len(stages) == expected_stages
+    assert stages[-1]["index"] == stages[-1]["total"] == expected_stages
     assert any(stage["message"] == "估计曝光补偿" for stage in stages)
 
 
@@ -244,4 +253,5 @@ def test_guided_api_reuses_progress_exposure_seam_and_blend(tmp_path, monkeypatc
         "estimate_exposure_errors", "find_seam_masks", "initialize_composition",
     ]
     assert stitcher.pair_diagnostics[0]["status"] == "refined"
-    assert len(stitcher.debug_info()["stages"]) == 17
+    expected_stages = 19 if settings["guided_mesh_enabled"] else 17
+    assert len(stitcher.debug_info()["stages"]) == expected_stages

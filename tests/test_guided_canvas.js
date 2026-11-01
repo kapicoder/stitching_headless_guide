@@ -105,10 +105,22 @@ close(sandbox.testResultView.y, -250);
 const debugText = sandbox.testFormatApiDebug({
   algorithm: 'guided_affine', output_width: 500, output_height: 900,
   debug_info: {image_count: 2, stages: [{index: 17, total: 17, percentage: 95,
-    message: '最终全景图完成', elapsed_seconds: 2.3}], timings: {}},
+    message: '最终全景图完成', elapsed_seconds: 2.3}], timings: {}, seam_mesh: {
+      enabled: true, status: 'applied', matches_used: 18, seam_refined: true,
+      images: [
+        {image_index: 0, status: 'fixed_reference', max_displacement_pixels: 0,
+          seam_support_pixels: 350},
+        {image_index: 1, status: 'refined', max_displacement_pixels: 2.375,
+          seam_support_pixels: 320, minimum_jacobian: 0.91},
+      ],
+    }},
+  settings: {guided_mesh_grid_spacing: 128, guided_mesh_seam_band_ratio: .15,
+    guided_mesh_max_displacement_ratio: .02, guided_mesh_min_matches: 12},
 });
 assert.match(debugText, /\[17\/17\] 最终全景图完成/);
 assert.match(debugText, /输出：500 × 900/);
+assert.match(debugText, /状态：已应用网格形变；启用：是；接缝匹配：18；实际应用：是/);
+assert.match(debugText, /图 2：已变形；最大位移 2\.375 px/);
 sandbox.testShowProgress();
 assert.equal(element('progress-overlay').hidden, false);
 sandbox.testUpdateProgress({exists: true, percentage: 65, status: '估计曝光补偿'});

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import time
 from pathlib import Path
@@ -286,6 +287,9 @@ def _run_headless_stitch(options: Dict[str, Any]) -> Dict[str, Any]:
     if "registration_status" in result_context:
         response["registration_status"] = result_context["registration_status"]
         response["image_diagnostics"] = result_context["image_diagnostics"]
+        response["refinement_limits_enabled"] = result_context[
+            "refinement_limits_enabled"
+        ]
         response["refinement_limits"] = result_context["refinement_limits"]
     return response
 
@@ -352,6 +356,34 @@ def _handle_headless_stitching_image() -> Any:
                     request_id,
                 )
             return jsonify({"error": str(exc)}), 500
+
+        debug_info = response.get("debug_info")
+        mesh_diagnostics = (
+            debug_info.get("seam_mesh")
+            if isinstance(debug_info, dict)
+            else None
+        )
+        if mesh_diagnostics is not None:
+            response_settings = response.get("settings", {})
+            mesh_settings = {
+                key: response_settings.get(key)
+                for key in (
+                    "guided_mesh_grid_spacing",
+                    "guided_mesh_seam_band_ratio",
+                    "guided_mesh_max_displacement_ratio",
+                    "guided_mesh_min_matches",
+                )
+                if key in response_settings
+            }
+            mesh_log = json.dumps(
+                {"settings": mesh_settings, "result": mesh_diagnostics},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            print(
+                f"[API] 接缝 Mesh 诊断 请求 #{request_id}: {mesh_log}",
+                flush=True,
+            )
 
         elapsed_seconds = time.perf_counter() - request_started_at
         print(

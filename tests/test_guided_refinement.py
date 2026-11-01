@@ -53,7 +53,9 @@ def test_rotation_limit_cannot_exceed_half_turn():
 
 
 def test_full_affine_micro_correction_preserves_large_initial_rotation_and_scale():
-    engine = GuidedAffineStitcher(show_progress=False)
+    engine = GuidedAffineStitcher(
+        show_progress=False, guided_refinement_limits_enabled=True
+    )
     initial = np.column_stack((1.5 * _rotation(70), [700, -200]))
     correction = _rotation(2) @ np.array([[1.01, 0.01], [0.01, 0.99]])
     items = _adjust(engine, correction, [2, -2], initial=initial)
@@ -73,7 +75,9 @@ def test_full_affine_micro_correction_preserves_large_initial_rotation_and_scale
     (np.array([[1, 0.04], [0.04, 1]]), [0, 0], {'guided_max_scale_change': 0.1}, '剪切'),
 ])
 def test_excessive_correction_keeps_exact_initial_matrix(linear, shift, overrides, reason):
-    engine = GuidedAffineStitcher(show_progress=False, **overrides)
+    engine = GuidedAffineStitcher(
+        show_progress=False, guided_refinement_limits_enabled=True, **overrides
+    )
     items = _adjust(engine, linear, shift)
     assert items[1]['correction_status'] == 'fallback_initial'
     assert reason in items[1]['correction_reason']
@@ -81,7 +85,7 @@ def test_excessive_correction_keeps_exact_initial_matrix(linear, shift, override
 
 
 def test_refinement_boundary_is_inclusive():
-    engine = GuidedAffineStitcher()
+    engine = GuidedAffineStitcher(guided_refinement_limits_enabled=True)
     metrics, reason = engine._check_refinement(_rotation(3) @ np.diag([1.03, 0.97]), np.array([9, 0]), 180)
     assert reason == ''
     assert metrics['translation_ratio'] == 0.05
@@ -90,7 +94,9 @@ def test_refinement_boundary_is_inclusive():
 
 @pytest.mark.parametrize('canvas_scale', [0.5, 1, 3])
 def test_translation_limit_uses_initial_canvas_short_side(canvas_scale):
-    engine = GuidedAffineStitcher(show_progress=False)
+    engine = GuidedAffineStitcher(
+        show_progress=False, guided_refinement_limits_enabled=True
+    )
     initial = np.column_stack((canvas_scale * np.eye(2), [400, 50]))
     items = _adjust(engine, np.eye(2), np.array([8, 0]) * canvas_scale, initial=initial)
     assert items[1]['correction_status'] == 'refined'
@@ -98,7 +104,9 @@ def test_translation_limit_uses_initial_canvas_short_side(canvas_scale):
 
 
 def test_excessive_bridge_removes_downstream_refinement():
-    engine = GuidedAffineStitcher(show_progress=False)
+    engine = GuidedAffineStitcher(
+        show_progress=False, guided_refinement_limits_enabled=True
+    )
     initial = np.eye(2, 3)
     items = [{'size': (250, 180), 'initial_matrix': initial.copy(), 'matrix': initial.copy(),
               'correction_status': 'fallback_initial'} for _ in range(3)]
@@ -126,17 +134,31 @@ def test_small_shear_and_nonuniform_scale_are_refined(tmp_path):
     np.testing.assert_allclose(transformed, corners + [170, 0], atol=0.2)
 
 
+def test_refinement_limits_are_disabled_by_default():
+    engine = GuidedAffineStitcher(show_progress=False)
+    items = _adjust(engine, np.eye(2), [20, 0])
+
+    assert engine.refinement_limits_enabled is False
+    assert items[1]['correction_status'] == 'refined'
+    assert items[1]['attempted_correction']['translation_ratio'] > 0.05
+
+
 @pytest.mark.parametrize('limit, expected', [(0.05, 'full'), (0.01, 'manual_only')])
 def test_api_applies_requested_micro_limits_and_reports_attempt(tmp_path, limit, expected):
     first, second = _write_pair(tmp_path)
     response = app.test_client().post('/stitch', json={
         'images': _images(first, second, 174), 'output_path': str(tmp_path / 'out.png'),
         'show_progress': False,
-        'settings': {'algorithm': 'guided_affine', 'georef_mode': 'none', 'guided_max_translation_ratio': limit},
+        'settings': {
+            'algorithm': 'guided_affine', 'georef_mode': 'none',
+            'guided_refinement_limits_enabled': True,
+            'guided_max_translation_ratio': limit,
+        },
     })
     assert response.status_code == 200, response.get_json()
     data = response.get_json()
     assert data['registration_status'] == expected
+    assert data['refinement_limits_enabled'] is True
     assert data['refinement_limits']['translation_ratio'] == limit
     diagnostic = data['image_diagnostics'][1]
     assert diagnostic['attempted_correction']['translation_ratio'] == pytest.approx(4/180, abs=1e-4)

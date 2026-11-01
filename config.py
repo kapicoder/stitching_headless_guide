@@ -23,6 +23,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "guided_min_inliers": 8,
     # RANSAC 误差使用目标特征图像素，不使用画布单位。
     "guided_ransac_threshold_px": 3.0,
+    # 是否以完整仿射微调幅度拒绝修正；仍保留上限供调试时启用。
+    "guided_refinement_limits_enabled": False,
     # 完整仿射微调上限，均相对于用户的初始布局。
     # 平移使用图像中心位移 / 初始画布短边，旋转使用极分解角度。
     "guided_max_translation_ratio": 0.05,
@@ -30,15 +32,21 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 缩放限制极分解的两个主伸缩率，剪切为对称伸缩矩阵的归一化非对角项。
     "guided_max_scale_change": 0.03,
     "guided_max_shear": 0.03,
+    # 接缝局部网格默认关闭；开启后只使用接缝附近的可靠匹配残差。
+    "guided_mesh_enabled": True,
+    "guided_mesh_grid_spacing": 128,
+    "guided_mesh_seam_band_ratio": 0.25,
+    "guided_mesh_max_displacement_ratio": 0.02,
+    "guided_mesh_min_matches": 12,
     "match_conf": 0.65,
     "confidence_threshold": 0.3,
     
-    "matcher_type": "affine",
-    "range_width": -1,    ##设置为-1为全匹配
-    "estimator": "affine",
-    "adjuster": "affine",
-    "warper_type": "affine",
     
+    "matcher_type": "homography",
+    "range_width": -1,
+    "estimator": "homography",
+    "adjuster": "reproj",
+    "warper_type": "plane",
     "wave_correct_kind": "no",
     "compensator": "channel_blocks",
     
@@ -193,7 +201,8 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
     for key in {
         "nfeatures", "range_width", "image_io_workers", "apap_grid_parts", "apap_min_matches",
         "apap_blend_width",
-        "guided_min_overlap_pixels", "guided_min_inliers",
+        "guided_min_overlap_pixels", "guided_min_inliers", "guided_mesh_grid_spacing",
+        "guided_mesh_min_matches",
     }:
         settings[key] = int(settings[key])
     for key in {
@@ -202,6 +211,7 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
         "guided_overlap_margin_ratio", "guided_ransac_threshold_px",
         "guided_max_translation_ratio", "guided_max_rotation_degrees",
         "guided_max_scale_change", "guided_max_shear",
+        "guided_mesh_seam_band_ratio", "guided_mesh_max_displacement_ratio",
     }:
         settings[key] = float(settings[key])
     settings["crop"] = _as_bool(settings["crop"])
@@ -210,6 +220,10 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
     settings["prefetch_final_images"] = _as_bool(settings["prefetch_final_images"])
     settings["cache_all_valid_masks"] = _as_bool(settings["cache_all_valid_masks"])
     settings["shared_warp_maps"] = _as_bool(settings["shared_warp_maps"])
+    settings["guided_refinement_limits_enabled"] = _as_bool(
+        settings["guided_refinement_limits_enabled"]
+    )
+    settings["guided_mesh_enabled"] = _as_bool(settings["guided_mesh_enabled"])
     settings["georef_mode"] = str(settings["georef_mode"]).strip().lower()
     if settings["georef_mode"] not in {"affine_fit", "copy", "none"}:
         raise ValueError("georef_mode 只支持 affine_fit、copy 或 none")
@@ -229,6 +243,15 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} 必须是非负的有限数值")
     if settings["guided_max_rotation_degrees"] > 180:
         raise ValueError("guided_max_rotation_degrees 不能超过180度")
+    if settings["guided_mesh_grid_spacing"] < 16:
+        raise ValueError("guided_mesh_grid_spacing 必须大于等于16个低分辨率像素")
+    if not 0 <= settings["guided_mesh_seam_band_ratio"] <= 0.5:
+        raise ValueError("guided_mesh_seam_band_ratio 必须在0到0.5之间")
+    if (not math.isfinite(settings["guided_mesh_max_displacement_ratio"])
+            or not 0 <= settings["guided_mesh_max_displacement_ratio"] <= 0.2):
+        raise ValueError("guided_mesh_max_displacement_ratio 必须在0到0.2之间")
+    if settings["guided_mesh_min_matches"] < 8:
+        raise ValueError("guided_mesh_min_matches 必须至少为8")
     if not 0 < settings["match_conf"] <= 1:
         raise ValueError("match_conf 必须大于0且小于等于1")
     if settings["range_width"] != -1 and settings["range_width"] < 1:

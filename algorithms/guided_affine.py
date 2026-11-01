@@ -18,8 +18,12 @@ GUIDED_DEFAULT_SETTINGS: dict[str, Any] = {
     key: DEFAULT_SETTINGS[key] for key in (
         "guided_min_overlap_pixels", "guided_overlap_margin_ratio",
         "guided_min_inliers", "guided_ransac_threshold_px",
+        "guided_refinement_limits_enabled",
         "guided_max_translation_ratio", "guided_max_rotation_degrees",
         "guided_max_scale_change", "guided_max_shear",
+        "guided_mesh_enabled", "guided_mesh_grid_spacing",
+        "guided_mesh_seam_band_ratio", "guided_mesh_max_displacement_ratio",
+        "guided_mesh_min_matches",
     )
 }
 
@@ -30,8 +34,12 @@ GUIDED_SETTING_KEYS = {
     "blend_strength", "crop", "guided_min_overlap_pixels",
     "guided_overlap_margin_ratio", "guided_min_inliers",
     "guided_ransac_threshold_px",
+    "guided_refinement_limits_enabled",
     "guided_max_translation_ratio", "guided_max_rotation_degrees",
     "guided_max_scale_change", "guided_max_shear",
+    "guided_mesh_enabled", "guided_mesh_grid_spacing",
+    "guided_mesh_seam_band_ratio", "guided_mesh_max_displacement_ratio",
+    "guided_mesh_min_matches",
 }
 
 
@@ -159,6 +167,9 @@ class GuidedAffineStitcher:
         guided_overlap_margin_ratio=GUIDED_DEFAULT_SETTINGS["guided_overlap_margin_ratio"],
         guided_min_inliers=GUIDED_DEFAULT_SETTINGS["guided_min_inliers"],
         guided_ransac_threshold_px=GUIDED_DEFAULT_SETTINGS["guided_ransac_threshold_px"],
+        guided_refinement_limits_enabled=GUIDED_DEFAULT_SETTINGS[
+            "guided_refinement_limits_enabled"
+        ],
         guided_max_translation_ratio=GUIDED_DEFAULT_SETTINGS["guided_max_translation_ratio"],
         guided_max_rotation_degrees=GUIDED_DEFAULT_SETTINGS["guided_max_rotation_degrees"],
         guided_max_scale_change=GUIDED_DEFAULT_SETTINGS["guided_max_scale_change"],
@@ -181,6 +192,7 @@ class GuidedAffineStitcher:
         self.overlap_margin_ratio = float(guided_overlap_margin_ratio)
         self.min_inliers = int(guided_min_inliers)
         self.ransac_threshold_px = float(guided_ransac_threshold_px)
+        self.refinement_limits_enabled = bool(guided_refinement_limits_enabled)
         if not math.isfinite(self.ransac_threshold_px) or self.ransac_threshold_px <= 0:
             raise ValueError("guided_ransac_threshold_px 必须是大于0的有限数值")
         self.refinement_limits = {
@@ -199,6 +211,7 @@ class GuidedAffineStitcher:
         self.output_offset = [0.0, 0.0]
         self.output_scale = 1.0
         self.pair_diagnostics: list[dict[str, Any]] = []
+        self.registration_pairs: list[dict[str, Any]] = []
         self.registration_status = "manual_only"
         self.image_diagnostics: list[dict[str, Any]] = []
 
@@ -460,8 +473,11 @@ class GuidedAffineStitcher:
             "scale_change": float(np.max(np.abs(singular - 1.0))),
             "shear": float(abs(stretch[0, 1]) / math.sqrt(stretch[0, 0] * stretch[1, 1])),
         }
-        exceeded = [name for name, value in metrics.items()
-                    if value > self.refinement_limits[name] + 1e-9]
+        exceeded = (
+            [name for name, value in metrics.items()
+             if value > self.refinement_limits[name] + 1e-9]
+            if self.refinement_limits_enabled else []
+        )
         labels = {"translation_ratio": "中心平移", "rotation_degrees": "旋转角度",
                   "scale_change": "缩放", "shear": "剪切"}
         reason = ""
@@ -558,6 +574,7 @@ class GuidedAffineStitcher:
         return {
             "registration_status": self.registration_status,
             "image_diagnostics": self.image_diagnostics,
+            "refinement_limits_enabled": self.refinement_limits_enabled,
             "refinement_limits": self.refinement_limits,
         }
 
@@ -636,6 +653,7 @@ class GuidedAffineStitcher:
         """只执行人工仿射约束和重叠区匹配，供原拼接流程复用。"""
         items = validate_images(images)
         self.pair_diagnostics = []
+        self.registration_pairs = []
         self._log("读取特征分辨率图像", 15.0)
         for index, item in enumerate(items):
             item["initial_matrix"] = item["matrix"].copy()
@@ -662,6 +680,14 @@ class GuidedAffineStitcher:
                                               "search_margin_pixels": round(margin, 2), **info})
                 if match is not None:
                     accepted.append((i, j, *match))
+                    inverse_a = cv2.invertAffineTransform(items[i]["initial_matrix"])
+                    inverse_b = cv2.invertAffineTransform(items[j]["initial_matrix"])
+                    self.registration_pairs.append({
+                        "image_a": i,
+                        "image_b": j,
+                        "source_points_a": _points(inverse_a, match[0]),
+                        "source_points_b": _points(inverse_b, match[1]),
+                    })
         for item in items:
             item.pop("medium")
             item.pop("medium_mask")

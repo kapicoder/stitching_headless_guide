@@ -20,6 +20,7 @@ from stitching.images import Images
 from stitching.seam_finder import SeamFinder
 
 from algorithms.guided_affine import GuidedAffineStitcher
+from algorithms.seam_mesh import solve_seam_mesh, warp_with_mesh
 from image_io import (
     is_tiff_path,
     read_input_image,
@@ -89,7 +90,11 @@ class ProgressStitcher(Stitcher):
 
     def stitch(self, images, feature_masks=None):
         self._stage_index = 0
-        self._stage_total = 17 if self._uses_guided_geometry() else 22
+        self._stage_total = (
+            19 if self._uses_seam_mesh()
+            else 17 if self._uses_guided_geometry()
+            else 22
+        )
         self.stage_events = []
         self._started_at = time.perf_counter()
         self._custom_panorama = None
@@ -153,7 +158,45 @@ class ProgressStitcher(Stitcher):
         self._progress(65.0, "估计曝光补偿")
         self.estimate_exposure_errors(corners, imgs, masks)
         self._progress(70.0, "查找接缝掩膜")
-        seam_masks = self.find_seam_masks(imgs, corners, masks)
+        if self._uses_seam_mesh():
+            valid_masks = [self._as_array(mask).copy() for mask in masks]
+            seam_masks = self.find_seam_masks(
+                imgs, corners, [mask.copy() for mask in valid_masks]
+            )
+            initial_seam_masks = [self._as_array(mask).copy() for mask in seam_masks]
+            self._progress(72.0, "估计接缝附近的网格位移")
+            try:
+                self._fit_seam_mesh(imgs, valid_masks, seam_masks, corners)
+                if any(field is not None for field in self.seam_mesh_fields):
+                    refined_images, refined_masks = [], []
+                    for index, field in enumerate(self.seam_mesh_fields):
+                        image, mask = warp_with_mesh(
+                            imgs[index], valid_masks[index], field
+                        )
+                        refined_images.append(image)
+                        refined_masks.append(mask)
+                    refined_seams = self.find_seam_masks(
+                        refined_images, corners,
+                        [mask.copy() for mask in refined_masks],
+                    )
+                    imgs = refined_images
+                    valid_masks = refined_masks
+                    seam_masks = [self._as_array(mask) for mask in refined_seams]
+                    self.mesh_diagnostics["seam_refined"] = True
+                else:
+                    seam_masks = initial_seam_masks
+            except (cv2.error, ValueError, RuntimeError, np.linalg.LinAlgError, MemoryError) as exc:
+                self.seam_mesh_fields = [None] * len(imgs)
+                self.mesh_diagnostics.update({
+                    "status": "fallback_local_error",
+                    "reason": str(exc)[:240],
+                })
+                for image_info in self.mesh_diagnostics.get("images", []):
+                    image_info["status"] = "fallback_local_error"
+                seam_masks = initial_seam_masks
+            self._progress(74.0, "完成网格校正与接缝更新")
+        else:
+            seam_masks = self.find_seam_masks(imgs, corners, masks)
         self._progress(75.0, "缩放到最终输出分辨率")
         imgs = self.resize_final_resolution()
         self._progress(80.0, "最终分辨率投影变换")
@@ -209,6 +252,9 @@ class ProgressStitcher(Stitcher):
         }
 
     def _uses_guided_geometry(self):
+        return False
+
+    def _uses_seam_mesh(self):
         return False
 
     def _prepare_guided_geometry(self, imgs):
@@ -863,13 +909,85 @@ class GuidedProgressStitcher(ProgressStitcher):
         kwargs["crop"] = False
         super().__init__(*args, **kwargs)
         self.guided_images = guided_images
+        mesh_settings = dict(guided_settings)
+        self.mesh_enabled = bool(mesh_settings.pop("guided_mesh_enabled", False))
+        self.mesh_grid_spacing = int(mesh_settings.pop("guided_mesh_grid_spacing", 128))
+        self.mesh_seam_band_ratio = float(mesh_settings.pop("guided_mesh_seam_band_ratio", 0.15))
+        self.mesh_max_displacement_ratio = float(
+            mesh_settings.pop("guided_mesh_max_displacement_ratio", 0.02)
+        )
+        self.mesh_min_matches = int(mesh_settings.pop("guided_mesh_min_matches", 12))
         self.geometry = GuidedAffineStitcher(
-            **guided_settings, show_progress=False, output_path=None, matching_regions=matching_regions,
+            **mesh_settings, show_progress=False, output_path=None,
+            matching_regions=matching_regions,
         )
         self.items = []
         self.output_offset = [0.0, 0.0]
         self.output_scale = 1.0
         self.pair_diagnostics = []
+        self.seam_mesh_fields: list[dict[str, np.ndarray] | None] = []
+        self.mesh_low_corners: list[tuple[float, float]] = []
+        self.mesh_low_scale: float | None = None
+        self.mesh_diagnostics: dict = {
+            "enabled": self.mesh_enabled,
+            "status": "pending" if self.mesh_enabled else "disabled",
+            "matches_used": 0,
+            "images": [],
+        }
+
+    def _uses_seam_mesh(self):
+        return self.mesh_enabled
+
+    def _fit_seam_mesh(self, imgs, valid_masks, seam_masks, corners) -> None:
+        low_scale = self.images._get_scaler(Images.Resolution.LOW).scale
+        self.mesh_low_scale = float(low_scale)
+        self.mesh_low_corners = [tuple(map(float, corner)) for corner in corners]
+        accepted_pairs = {
+            (record["image_a"], record["image_b"])
+            for record in self.geometry.pair_diagnostics
+            if record.get("status") == "refined"
+        }
+        constraints = []
+        for pair in self.geometry.registration_pairs:
+            image_a, image_b = pair["image_a"], pair["image_b"]
+            if (image_a, image_b) not in accepted_pairs:
+                continue
+            item_a, item_b = self.items[image_a], self.items[image_b]
+            world_a = (
+                pair["source_points_a"] @ item_a["matrix"][:, :2].T
+                + item_a["matrix"][:, 2]
+            )
+            world_b = (
+                pair["source_points_b"] @ item_b["matrix"][:, :2].T
+                + item_b["matrix"][:, 2]
+            )
+            constraints.append({
+                "image_a": image_a,
+                "image_b": image_b,
+                "points_a": world_a * low_scale - np.asarray(corners[image_a]),
+                "points_b": world_b * low_scale - np.asarray(corners[image_b]),
+                "residuals": (world_b - world_a) * low_scale,
+            })
+        movable = [
+            item["correction_status"] in {"reference", "refined"}
+            for item in self.items
+        ]
+        self.seam_mesh_fields, self.mesh_diagnostics = solve_seam_mesh(
+            [img.shape[:2] for img in imgs],
+            valid_masks,
+            [self._as_array(mask) for mask in seam_masks],
+            constraints,
+            movable,
+            grid_spacing=self.mesh_grid_spacing,
+            seam_band_ratio=self.mesh_seam_band_ratio,
+            max_displacement_ratio=self.mesh_max_displacement_ratio,
+            min_matches=self.mesh_min_matches,
+        )
+
+    def debug_info(self) -> dict:
+        info = super().debug_info()
+        info["seam_mesh"] = self.mesh_diagnostics
+        return info
 
     def _uses_guided_geometry(self):
         return True
@@ -904,6 +1022,23 @@ class GuidedProgressStitcher(ProgressStitcher):
         matrix[:, 2] = scale * matrix[:, 2] - np.array(corner)
         warped_img = cv2.warpAffine(img, matrix, size, flags=cv2.INTER_LINEAR)
         warped_mask = cv2.warpAffine(mask, matrix, size, flags=cv2.INTER_NEAREST)
+        if (
+            resolution == Images.Resolution.FINAL
+            and self.mesh_enabled
+            and self.seam_mesh_fields[index] is not None
+        ):
+            if self.mesh_low_scale is None or index >= len(self.mesh_low_corners):
+                raise RuntimeError("局部网格缺少低分辨率坐标信息")
+            mesh_scale = scale / self.mesh_low_scale
+            warped_img, warped_mask = warp_with_mesh(
+                warped_img,
+                warped_mask,
+                self.seam_mesh_fields[index],
+                inplace=True,
+                low_to_output_scale=(mesh_scale, mesh_scale),
+                low_origin=self.mesh_low_corners[index],
+                output_origin=corner,
+            )
         return warped_img, warped_mask
 
     def warp_low_resolution(self, imgs, cameras):
