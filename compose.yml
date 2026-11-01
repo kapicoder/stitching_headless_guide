@@ -1,0 +1,22 @@
+services:
+  stitching-headless-api:
+    image: stitching-headless-api:latest
+    pull_policy: never
+    platform: linux/amd64
+    container_name: stitching-headless-api-guide
+    working_dir: /workspace
+    init: true
+    shm_size: "2gb"
+
+    volumes:
+      - ./:/workspace:ro
+      - ./output:/workspace/output
+
+    ports:
+      - "${HOST_PORT:-8002}:8000"
+
+    environment:
+      PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+
+    restart: unless-stopped

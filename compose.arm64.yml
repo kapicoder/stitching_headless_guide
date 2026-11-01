@@ -1,0 +1,36 @@
+# ARM64 架构的图像拼接 API 容器配置。
+#
+# 用途：在 ARM64 电脑上作为默认 compose.yml 启动 API。服务名、容器名和
+# 端口变量与 x86 配置保持一致，但 Numba 机器码缓存仍使用 ARM64 专用目录。
+#
+# 启动：HOST_PORT=8002 docker compose up -d
+# 日志：docker compose logs -f stitching-headless-api
+# 停止：docker compose down
+
+services:
+  stitching-headless-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: "${APP_UID:-1000}"
+        APP_GID: "${APP_GID:-1000}"
+    image: stitching-headless-api:arm64
+    platform: linux/arm64
+    container_name: stitching-headless-api
+    working_dir: /workspace
+    init: true
+    shm_size: "2gb"
+
+    volumes:
+      - ./:/workspace:ro
+      - ./output:/workspace/output
+
+    ports:
+      - "${HOST_PORT:-8002}:8000"
+
+    environment:
+      PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+
+    restart: unless-stopped

@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>人工四点引导拼接 · 验证画布</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #111820; color: #e9f0f4; }
+    button, input, select { font: inherit; }
+    button { border: 1px solid #455666; background: #263544; color: #e9f0f4; border-radius: 7px; padding: 7px 11px; cursor: pointer; }
+    button:hover { background: #365069; }
+    button:disabled { opacity: .5; cursor: default; }
+    input, select { width: 100%; border: 1px solid #455666; border-radius: 6px; padding: 7px 9px; background: #17232e; color: #f5f8fa; }
+    label { display: block; color: #bed0de; font-size: 13px; margin: 0 0 5px; }
+    h1 { font-size: 20px; margin: 0; }
+    h2 { font-size: 14px; letter-spacing: .02em; margin: 0 0 10px; }
+    p { line-height: 1.5; }
+    .app { display: grid; grid-template-columns: minmax(280px, 320px) minmax(0, 1fr); min-height: 100vh; }
+    aside { padding: 20px; border-right: 1px solid #354455; overflow-y: auto; max-height: 100vh; }
+    main { display: flex; flex-direction: column; min-width: 0; }
+    .muted { color: #98aabb; font-size: 13px; }
+    .card { border: 1px solid #36495a; border-radius: 10px; padding: 13px; margin-top: 15px; background: #1a2733; }
+    .image-item { width: 100%; display: flex; justify-content: space-between; align-items: center; text-align: left; margin: 5px 0; overflow-wrap: anywhere; }
+    .image-item.active { border-color: #67b9e5; background: #24445b; }
+    .image-item small { margin-left: 8px; color: #a9bfce; white-space: nowrap; }
+    .row { display: flex; gap: 7px; align-items: center; }
+    .row > * { flex: 1; min-width: 0; }
+    .field { margin: 10px 0; }
+    .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; padding: 10px 14px; border-bottom: 1px solid #354455; }
+    .toolbar span { color: #afc0cb; font-size: 13px; margin-left: auto; }
+    .workspace { flex: 1; min-height: 470px; position: relative; overflow: hidden; }
+    #canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+    #canvas.dragging { cursor: grabbing; }
+    .bottom { padding: 12px 15px 18px; border-top: 1px solid #354455; }
+    #status { margin: 0 0 7px; white-space: pre-wrap; }
+    #result-panel { display: none; margin-top: 12px; }
+    .result-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 8px; }
+    .result-toolbar span { margin-left: auto; color: #afc0cb; font-size: 13px; }
+    #result-viewer { position: relative; width: 100%; height: clamp(420px, 55vh, 820px); overflow: hidden; background: #101820; border: 1px solid #455666; border-radius: 8px; touch-action: none; cursor: grab; }
+    #result-viewer.dragging { cursor: grabbing; }
+    #result-viewer:fullscreen { height: 100vh; border: 0; border-radius: 0; }
+    #result-preview { position: absolute; left: 0; top: 0; display: block; max-width: none; max-height: none; user-select: none; pointer-events: none; transform-origin: 0 0; }
+    pre { white-space: pre-wrap; word-break: break-word; color: #b9d9ec; font-size: 12px; margin: 8px 0 0; }
+    .primary { background: #126b92; border-color: #3faad7; }
+    .primary:hover { background: #167fae; }
+    .error { color: #ffafa3; }
+    .success { color: #9be6b1; }
+    .progress-overlay { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(4, 12, 19, .78); }
+    .progress-overlay[hidden] { display: none; }
+    .progress-dialog { width: min(100%, 480px); padding: 23px; border: 1px solid #5b8298; border-radius: 12px; background: #1a2b39; box-shadow: 0 18px 60px rgba(0,0,0,.45); }
+    .progress-dialog h2 { font-size: 18px; margin: 0 0 17px; }
+    #progress-bar { display: block; width: 100%; height: 18px; accent-color: #53b9e6; }
+    #progress-percent { font-size: 22px; font-weight: 700; margin: 12px 0 4px; }
+    #progress-stage { margin: 0; min-height: 2.5em; }
+    @media (max-width: 760px) { .app { grid-template-columns: 1fr; } aside { max-height: none; border-right: 0; border-bottom: 1px solid #354455; } .workspace { min-height: 60vh; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <h1>人工引导拼接</h1>
+      <p class="muted">第一张图固定在 (0, 0)。选中其他图后，拖动图像平移、拖动四角等比例缩放、拖动上方圆点旋转。API 会在重叠区及周边搜索特征。</p>
+      <div class="card">
+        <h2>输入图像（按拼接顺序）</h2>
+        <div class="field"><label for="image-files">选择本机图片（可多选，按选择顺序排列）</label><input id="image-files" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff,image/jpeg,image/png,image/tiff" multiple></div>
+        <button id="load-images" type="button" style="width:100%">读取图像并重建画布</button>
+        <p class="muted">至少选择两张；新选择会替换当前图像。支持 JPG、PNG、TIFF。</p>
+        <div id="image-list"></div>
+      </div>
+      <div class="card">
+        <h2>选中图像</h2>
+        <div id="selected-name" class="muted">—</div>
+        <p class="muted">直接拖动图像平移、拖动四角缩放、拖动上方圆点旋转；按住 Shift 旋转时以 15° 吸附。第一张图锁定。</p>
+        <div class="field"><label for="opacity">预览透明度 <span id="opacity-value"></span></label><input id="opacity" type="range" min="20" max="100" value="72"></div>
+      </div>
+      <div class="card">
+        <h2>拼接区域</h2>
+        <select id="edit-mode"><option value="images">摆放图片</option><option value="regions">选择拼接区域</option></select>
+        <button id="delete-region">删除选中框</button><button id="clear-regions">清空框</button>
+        <p class="muted">在空白处拖动新增框；拖框移动，拖四角缩放。框固定在共享画布中。框内纹理不足时请扩大框或提高 medium_megapix。</p>
+        <div id="region-list" class="muted"></div>
+      </div>
+      <div class="card">
+        <h2>执行拼接</h2>
+        <div class="field"><label for="output-name">输出文件名（保存在 output/）</label><input id="output-name" value="guided_result.jpg"></div>
+        <div class="field"><label for="final-megapix">每张图最终分辨率（百万像素）</label><input id="final-megapix" type="number" step="0.1" value="2"></div>
+        <div class="field"><label for="blender-type">融合方式</label><select id="blender-type"><option value="multiband" selected>多频段（质量更高）</option><option value="feather">羽化（验证速度快）</option><option value="no">无融合（检查几何位置）</option></select></div>
+        <button id="run" class="primary" style="width:100%">调用拼接 API</button>
+        <p class="muted">目标 API：{{ api_url }}<br>首次请求可能需要等待容器预热。</p>
+      </div>
+    </aside>
+    <main>
+      <div class="toolbar">
+        <button id="zoom-out">−</button><button id="zoom-in">＋</button><button id="fit">适合画布</button><button id="reset">重置位置</button>
+        <span id="zoom-label"></span><span>拖四角缩放 · 拖上方圆点旋转 · 空格拖动画布 · 滚轮缩放</span>
+      </div>
+      <div class="workspace" id="workspace"><canvas id="canvas"></canvas></div>
+      <div class="bottom">
+        <p id="status" class="muted">拖动图片完成粗定位后，点击“调用拼接 API”。</p>
+        <div id="result-panel">
+          <div class="result-toolbar">
+            <button id="result-zoom-out" type="button">−</button>
+            <button id="result-zoom-in" type="button">＋</button>
+            <button id="result-fit" type="button">适合窗口</button>
+            <button id="result-actual" type="button">100%</button>
+            <button id="result-fullscreen" type="button">全屏查看</button>
+            <span id="result-zoom-label">滚轮缩放 · 拖动查看</span>
+          </div>
+          <div id="result-viewer"><img id="result-preview" alt="拼接结果预览" draggable="false"></div>
+        </div>
+        <p><a id="download-result" style="display:none;color:#85d9ff" download>下载原始结果</a></p>
+        <div id="result-info"></div>
+        <details id="api-debug-details" style="display:none" open>
+          <summary>本次 API 调试信息</summary>
+          <pre id="api-debug" style="max-height:40vh;overflow:auto"></pre>
+        </details>
+        <details><summary>查看当前四点坐标 / 请求数据</summary><pre id="coordinates"></pre></details>
+      </div>
+    </main>
+  </div>
+  <div id="progress-overlay" class="progress-overlay" role="dialog" aria-modal="true" aria-labelledby="progress-title" hidden>
+    <div class="progress-dialog">
+      <h2 id="progress-title">正在拼接图像</h2>
+      <progress id="progress-bar" max="100" value="0"></progress>
+      <div id="progress-percent">0%</div>
+      <p id="progress-stage" class="muted">正在准备拼接请求…</p>
+      <p class="muted">请保持此页面打开；完成后会自动显示结果。</p>
+    </div>
+  </div>
+  <script>
+    const descriptions = {{ images|tojson }};
+    const canvas = document.getElementById('canvas');
+    const workspace = document.getElementById('workspace');
+    const ctx = canvas.getContext('2d');
+    const state = { images: [],
+                    selected: descriptions.length > 1 ? 1 : 0, zoom: 1, panX: 0, panY: 0,
+                    regions: [], regionSerial: 0, selectedRegion: -1, mode: "images", dragging: null, space: false, opacity: .72 };
+    const $ = id => document.getElementById(id);
+    const number = value => Math.round(value * 1000) / 1000;
+
+    function resetPositions() {
+      state.regions = []; state.selectedRegion = -1;
+      if (!state.images.length) { draw(); return; }
+      let x = 0;
+      state.images.forEach((item, index) => {
+        if (index) x += state.images[index - 1].width * .75;
+        item.initialX = x;
+        item.corners = [[x, 0], [x + item.width, 0], [x + item.width, item.height], [x, item.height]];
+      });
+      fit();
+      updateSelection();
+    }
+
+    function bounds() {
+      const pts = state.images.flatMap(item => item.corners);
+      return { minX: Math.min(...pts.map(p => p[0])), maxX: Math.max(...pts.map(p => p[0])),
+               minY: Math.min(...pts.map(p => p[1])), maxY: Math.max(...pts.map(p => p[1])) };
+    }
+
+    function fit() {
+      const b = bounds(), width = workspace.clientWidth, height = workspace.clientHeight;
+      state.zoom = Math.max(.0001, Math.min((width - 80) / Math.max(1, b.maxX - b.minX),
+                                           (height - 80) / Math.max(1, b.maxY - b.minY)));
+      state.panX = (width - (b.minX + b.maxX) * state.zoom) / 2;
+      state.panY = (height - (b.minY + b.maxY) * state.zoom) / 2;
+      draw();
+    }
+
+    function resizeCanvas() {
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(workspace.clientWidth * ratio));
+      canvas.height = Math.max(1, Math.round(workspace.clientHeight * ratio));
+      draw();
+    }
+
+    function draw() {
+      if (!canvas.width) return;
+      const dpr = window.devicePixelRatio || 1;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = '#101a23'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.setTransform(dpr * state.zoom, 0, 0, dpr * state.zoom,
+                       dpr * state.panX, dpr * state.panY);
+      state.images.forEach((item, index) => {
+        const [tl, tr, br, bl] = item.corners;
+        if (item.bitmap) {
+          ctx.save();
+          ctx.globalAlpha = index === 0 ? .92 : state.opacity;
+          ctx.transform((tr[0] - tl[0]) / item.width, (tr[1] - tl[1]) / item.width,
+                        (bl[0] - tl[0]) / item.height, (bl[1] - tl[1]) / item.height,
+                        tl[0], tl[1]);
+          ctx.drawImage(item.bitmap, 0, 0, item.width, item.height);
+          ctx.restore();
+        }
+        ctx.beginPath(); ctx.moveTo(tl[0], tl[1]);
+        for (const point of [tr, br, bl]) ctx.lineTo(point[0], point[1]);
+        ctx.closePath(); ctx.lineWidth = (index === state.selected ? 3 : 1.5) / state.zoom;
+        ctx.strokeStyle = index === state.selected ? '#62d4ff' : index === 0 ? '#ffd782' : '#d0e7f0';
+        ctx.stroke();
+        ctx.save(); ctx.translate(tl[0], tl[1]); ctx.scale(1 / state.zoom, 1 / state.zoom);
+        ctx.fillStyle = index === 0 ? '#ffd782' : '#e6f6ff';
+        ctx.font = 'bold 14px sans-serif'; ctx.fillText(`${index + 1}. ${item.name}`, 6, -9);
+        ctx.restore();
+      });
+      if (state.selected > 0 && state.mode === "images") {
+        const selected = state.images[state.selected];
+        const corners = selected.corners;
+        ctx.beginPath(); ctx.moveTo(corners[0][0], corners[0][1]);
+        corners.slice(1).forEach(point => ctx.lineTo(point[0], point[1]));
+        ctx.closePath(); ctx.lineWidth = 3 / state.zoom; ctx.strokeStyle = '#62d4ff'; ctx.stroke();
+        const midpoint = [(corners[0][0] + corners[1][0]) / 2,
+                          (corners[0][1] + corners[1][1]) / 2];
+        const rotation = rotationHandle(selected);
+        ctx.beginPath(); ctx.moveTo(midpoint[0], midpoint[1]);
+        ctx.lineTo(rotation[0], rotation[1]); ctx.lineWidth = 2 / state.zoom;
+        ctx.strokeStyle = '#ffd782'; ctx.stroke();
+        corners.forEach(point => {
+          ctx.beginPath(); ctx.arc(point[0], point[1], 8 / state.zoom, 0, Math.PI * 2);
+          ctx.fillStyle = '#62d4ff'; ctx.fill();
+          ctx.lineWidth = 2 / state.zoom; ctx.strokeStyle = '#102230'; ctx.stroke();
+        });
+        ctx.beginPath(); ctx.arc(rotation[0], rotation[1], 9 / state.zoom, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffd782'; ctx.fill();
+        ctx.lineWidth = 2 / state.zoom; ctx.strokeStyle = '#102230'; ctx.stroke();
+      }
+      drawRegions();
+      $('zoom-label').textContent = `缩放 ${(state.zoom * 100).toFixed(2)}%`;
+      $('coordinates').textContent = JSON.stringify(state.images.map((item, index) => ({
+        index, name: item.name, corners: item.corners.map(p => p.map(number))
+      })), null, 2);
+    }
+
+    function rectCorners(rect) {
+      const [x,y,w,h] = rect;
+      return [[x,y],[x+w,y],[x+w,y+h],[x,y+h]];
+    }
+    // Convex clipping uses the same outward edge offsets as the backend.
+    function clipPolygon(subject, clip, margin = 0) {
+      let result = subject.map(p => [...p]);
+      for (let i = 0; i < clip.length && result.length; i++) {
+        const a = clip[i], b = clip[(i+1)%clip.length];
+        const dx = b[0]-a[0], dy = b[1]-a[1];
+        const distance = p => dx*(p[1]-a[1])-dy*(p[0]-a[0])+margin*Math.hypot(dx,dy);
+        const input = result; result = [];
+        for (let j = 0; j < input.length; j++) {
+          const p = input[j], q = input[(j+1)%input.length];
+          const dp = distance(p), dq = distance(q);
+          if (dp >= 0) result.push(p);
+          if ((dp >= 0) !== (dq >= 0)) {
+            const t = dp/(dp-dq);
+            result.push([p[0]+t*(q[0]-p[0]), p[1]+t*(q[1]-p[1])]);
+          }
+        }
+      }
+      return result;
+    }
+    function polygonArea(poly) {
+      return Math.abs(poly.reduce((sum,p,i) => {
+        const q = poly[(i+1)%poly.length]; return sum+p[0]*q[1]-p[1]*q[0];
+      },0))/2;
+    }
+    function regionPairs(region) {
+      const pairs = [], margin = state.images.length ? .1*Math.min(state.images[0].width,state.images[0].height) : 0;
+      for (let i=0;i<state.images.length;i++) for (let j=i+1;j<state.images.length;j++) {
+        const a = state.images[i].corners, b = state.images[j].corners;
+        const sa = clipPolygon(a,b,margin), sb = clipPolygon(b,a,margin);
+        if (Math.min(polygonArea(sa),polygonArea(sb)) < 100) continue;
+        const rect = rectCorners(region.rect);
+        if (polygonArea(clipPolygon(sa,rect)) > 0 && polygonArea(clipPolygon(sb,rect)) > 0) pairs.push(`${i+1}↔${j+1}`);
+      }
+      return pairs;
+    }
+    function drawRegions() {
+      const labels = [];
+      state.regions.forEach((region,index) => {
+        const [x,y,w,h] = region.rect, pairs = regionPairs(region);
+        const label = `框 ${index+1}：${pairs.length ? pairs.join('、') : '未覆盖候选图像对'}`;
+        labels.push(label);
+        ctx.strokeStyle = pairs.length ? '#7df2a8' : '#ffb86b';
+        ctx.lineWidth = (index === state.selectedRegion ? 3 : 1.5)/state.zoom;
+        ctx.strokeRect(x,y,w,h);
+        ctx.font = `${13/state.zoom}px sans-serif`; ctx.fillStyle = ctx.strokeStyle;
+        ctx.fillText(label,x,y-5/state.zoom);
+        if (state.mode === 'regions' && index === state.selectedRegion) {
+          rectCorners(region.rect).forEach(p => ctx.fillRect(p[0]-5/state.zoom,p[1]-5/state.zoom,10/state.zoom,10/state.zoom));
+        }
+      });
+      $('region-list').textContent = labels.join('；') || '未添加框：使用自动重叠区域';
+    }
+    $('edit-mode').onchange = event => { state.mode = event.target.value; stopDrag(); draw(); };
+    $('delete-region').onclick = () => {
+      if (state.selectedRegion >= 0) state.regions.splice(state.selectedRegion,1);
+      state.selectedRegion = -1; draw();
+    };
+    $('clear-regions').onclick = () => { state.regions = []; state.selectedRegion = -1; draw(); };
+
+    function pointInPolygon(point, polygon) {
+      let inside = false;
+      for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+        const a = polygon[i], b = polygon[j];
+        if ((a[1] > point[1]) !== (b[1] > point[1]) &&
+            point[0] < (b[0] - a[0]) * (point[1] - a[1]) / (b[1] - a[1]) + a[0]) inside = !inside;
+      }
+      return inside;
+    }
+
+    function worldPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return [(event.clientX - rect.left - state.panX) / state.zoom,
+              (event.clientY - rect.top - state.panY) / state.zoom];
+    }
+
+    function rotationHandle(item) {
+      const [tl, tr] = item.corners;
+      const dx = tr[0] - tl[0], dy = tr[1] - tl[1];
+      const length = Math.hypot(dx, dy);
+      return [(tl[0] + tr[0]) / 2 + dy / length * 36 / state.zoom,
+              (tl[1] + tr[1]) / 2 - dx / length * 36 / state.zoom];
+    }
+
+    function hitSelectedHandle(event) {
+      if (state.selected === 0 || state.space) return null;
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left, y = event.clientY - rect.top;
+      const distance = point => Math.hypot(x - point[0] * state.zoom - state.panX,
+                                            y - point[1] * state.zoom - state.panY);
+      const item = state.images[state.selected];
+      for (let index = 0; index < 4; index++) {
+        if (distance(item.corners[index]) <= 13) return {kind: 'scale', corner: index};
+      }
+      if (distance(rotationHandle(item)) <= 14) return {kind: 'rotate'};
+      return null;
+    }
+
+    function updateSelection() {
+      const item = state.images[state.selected];
+      if (!item) { $('selected-name').textContent = '请先读取至少两张图像'; draw(); return; }
+      $('selected-name').textContent = `${state.selected + 1}. ${item.name}${state.selected === 0 ? '（固定参考）' : ''}`;
+      document.querySelectorAll('.image-item').forEach((button, index) => button.classList.toggle('active', index === state.selected));
+      draw();
+    }
+
+    canvas.addEventListener('pointerdown', event => {
+      canvas.setPointerCapture(event.pointerId);
+      if (state.mode === 'regions' && !state.space && event.button === 0) {
+        const point = worldPoint(event), selected = state.regions[state.selectedRegion];
+        if (selected) {
+          const corner = rectCorners(selected.rect).findIndex(p => Math.hypot(p[0]-point[0],p[1]-point[1]) <= 10/state.zoom);
+          if (corner >= 0) {
+            state.dragging = {kind: 'region-scale', anchor: rectCorners(selected.rect)[(corner+2)%4]}; return;
+          }
+        }
+        let hit = -1;
+        for (let i=state.regions.length-1;i>=0;i--) if (pointInPolygon(point,rectCorners(state.regions[i].rect))) { hit=i; break; }
+        if (hit >= 0) {
+          state.selectedRegion = hit;
+          state.dragging = {kind: 'region-move', start: point, original: [...state.regions[hit].rect]};
+        } else if (state.regions.length < 32) {
+          state.regions.push({id: `region_${++state.regionSerial}`,rect: [point[0],point[1],0,0]});
+          state.selectedRegion = state.regions.length-1;
+          state.dragging = {kind: 'region-new', anchor: point};
+        }
+        draw(); return;
+      }
+      const handle = event.button === 0 && !state.space && state.mode === 'images' ? hitSelectedHandle(event) : null;
+      if (handle) {
+        const item = state.images[state.selected];
+        const original = item.corners.map(point => [...point]);
+        const center = [original.reduce((sum, point) => sum + point[0], 0) / 4,
+                        original.reduce((sum, point) => sum + point[1], 0) / 4];
+        const pointer = worldPoint(event);
+        state.dragging = {...handle, index: state.selected, original, center,
+                          startAngle: Math.atan2(pointer[1] - center[1], pointer[0] - center[0])};
+        canvas.classList.add('dragging');
+        canvas.style.cursor = handle.kind === 'rotate' ? 'crosshair' : 'nwse-resize';
+        return;
+      }
+      const point = worldPoint(event);
+      let hit = state.selected > 0 && pointInPolygon(point, state.images[state.selected].corners) ? state.selected : -1;
+      if (hit < 0) for (let index = state.images.length - 1; index >= 0; index--) {
+        if (pointInPolygon(point, state.images[index].corners)) { hit = index; break; }
+      }
+      if (hit >= 0) { state.selected = hit; updateSelection(); }
+      state.dragging = {kind: !state.space && event.button === 0 && hit > 0 ? 'image' : 'pan',
+                        lastX: event.clientX, lastY: event.clientY, index: hit};
+      canvas.classList.add('dragging');
+      canvas.style.cursor = 'grabbing';
+    });
+    canvas.addEventListener('pointermove', event => {
+      if (!state.dragging) {
+        const handle = state.mode === 'images' ? hitSelectedHandle(event) : null;
+        canvas.style.cursor = state.mode === 'regions' ? 'crosshair' : handle ? (handle.kind === 'rotate' ? 'crosshair' : 'nwse-resize') : 'grab';
+        return;
+      }
+      if (state.dragging.kind.startsWith('region-')) {
+        const drag = state.dragging, point = worldPoint(event), region = state.regions[state.selectedRegion];
+        if (drag.kind === 'region-move') {
+          region.rect = [drag.original[0]+point[0]-drag.start[0],drag.original[1]+point[1]-drag.start[1],...drag.original.slice(2)];
+        } else {
+          region.rect = [Math.min(point[0],drag.anchor[0]),Math.min(point[1],drag.anchor[1]),Math.abs(point[0]-drag.anchor[0]),Math.abs(point[1]-drag.anchor[1])];
+        }
+        draw(); return;
+      }
+      if (state.dragging.kind === 'scale') {
+        const item = state.images[state.dragging.index];
+        const original = state.dragging.original;
+        const anchor = original[(state.dragging.corner + 2) % 4];
+        const moving = original[state.dragging.corner];
+        const diagonal = [moving[0] - anchor[0], moving[1] - anchor[1]];
+        const pointer = worldPoint(event);
+        const proposed = ((pointer[0] - anchor[0]) * diagonal[0] +
+                          (pointer[1] - anchor[1]) * diagonal[1]) /
+                         (diagonal[0] ** 2 + diagonal[1] ** 2);
+        const currentScale = Math.hypot(original[1][0] - original[0][0],
+                                        original[1][1] - original[0][1]) / item.width;
+        const factor = Math.min(5 / currentScale, Math.max(.2 / currentScale, proposed));
+        item.corners = original.map(point => [anchor[0] + (point[0] - anchor[0]) * factor,
+                                               anchor[1] + (point[1] - anchor[1]) * factor]);
+      } else if (state.dragging.kind === 'rotate') {
+        const item = state.images[state.dragging.index];
+        const {original, center, startAngle} = state.dragging;
+        const pointer = worldPoint(event);
+        let angle = Math.atan2(pointer[1] - center[1], pointer[0] - center[0]) - startAngle;
+        if (event.shiftKey) angle = Math.round(angle / (Math.PI / 12)) * (Math.PI / 12);
+        const c = Math.cos(angle), s = Math.sin(angle);
+        item.corners = original.map(point => {
+          const x = point[0] - center[0], y = point[1] - center[1];
+          return [center[0] + c * x - s * y, center[1] + s * x + c * y];
+        });
+      } else if (state.dragging.kind === 'image') {
+        const dx = event.clientX - state.dragging.lastX, dy = event.clientY - state.dragging.lastY;
+        const item = state.images[state.dragging.index];
+        item.corners = item.corners.map(p => [p[0] + dx / state.zoom, p[1] + dy / state.zoom]);
+      } else {
+        state.panX += event.clientX - state.dragging.lastX;
+        state.panY += event.clientY - state.dragging.lastY;
+      }
+      state.dragging.lastX = event.clientX; state.dragging.lastY = event.clientY;
+      draw();
+    });
+    function stopDrag() { state.regions = state.regions.filter(r => r.rect[2] > 0 && r.rect[3] > 0); if (state.selectedRegion >= state.regions.length) state.selectedRegion = -1; state.dragging = null; canvas.classList.remove('dragging'); canvas.style.cursor = 'grab'; }
+    canvas.addEventListener('pointerup', stopDrag);
+    canvas.addEventListener('pointercancel', stopDrag);
+    canvas.addEventListener('wheel', event => {
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect(), x = event.clientX - rect.left, y = event.clientY - rect.top;
+      const worldX = (x - state.panX) / state.zoom, worldY = (y - state.panY) / state.zoom;
+      state.zoom = Math.max(.0001, Math.min(8, state.zoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12)));
+      state.panX = x - worldX * state.zoom; state.panY = y - worldY * state.zoom;
+      draw();
+    }, {passive: false});
+    window.addEventListener('keydown', event => {
+      if (event.code === 'Space' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
+        state.space = true; event.preventDefault();
+      }
+    });
+    window.addEventListener('keyup', event => { if (event.code === 'Space') state.space = false; });
+    $('fit').onclick = fit;
+    $('reset').onclick = resetPositions;
+    $('zoom-in').onclick = () => { state.zoom *= 1.2; draw(); };
+    $('zoom-out').onclick = () => { state.zoom /= 1.2; draw(); };
+    $('opacity').oninput = event => {
+      state.opacity = Number(event.target.value) / 100;
+      $('opacity-value').textContent = `${event.target.value}%`;
+      draw();
+    };
+    $('opacity').dispatchEvent(new Event('input'));
+
+    const resultViewer = $('result-viewer');
+    const resultImage = $('result-preview');
+    const resultView = {scale: 1, x: 0, y: 0, drag: null, fitMode: true};
+
+    function drawResult() {
+      resultImage.style.transform = `translate(${resultView.x}px, ${resultView.y}px) scale(${resultView.scale})`;
+      $('result-zoom-label').textContent = `${(resultView.scale * 100).toFixed(1)}% · 滚轮缩放 · 拖动查看`;
+    }
+
+    function fitResult() {
+      if (!resultImage.naturalWidth || !resultImage.naturalHeight) return;
+      const width = resultViewer.clientWidth, height = resultViewer.clientHeight;
+      resultView.scale = Math.min(width / resultImage.naturalWidth,
+                                  height / resultImage.naturalHeight);
+      resultView.x = (width - resultImage.naturalWidth * resultView.scale) / 2;
+      resultView.y = (height - resultImage.naturalHeight * resultView.scale) / 2;
+      resultView.fitMode = true;
+      drawResult();
+    }
+
+    function zoomResult(factor, x = resultViewer.clientWidth / 2, y = resultViewer.clientHeight / 2) {
+      if (!resultImage.naturalWidth) return;
+      const oldScale = resultView.scale;
+      const nextScale = Math.max(0.0001, Math.min(16, oldScale * factor));
+      const ratio = nextScale / oldScale;
+      resultView.x = x - (x - resultView.x) * ratio;
+      resultView.y = y - (y - resultView.y) * ratio;
+      resultView.scale = nextScale;
+      resultView.fitMode = false;
+      drawResult();
+    }
+
+    resultImage.onload = fitResult;
+    $('result-fit').onclick = fitResult;
+    $('result-actual').onclick = () => zoomResult(1 / resultView.scale);
+    $('result-zoom-in').onclick = () => zoomResult(1.25);
+    $('result-zoom-out').onclick = () => zoomResult(1 / 1.25);
+    $('result-fullscreen').onclick = () => {
+      if (document.fullscreenElement === resultViewer) document.exitFullscreen();
+      else resultViewer.requestFullscreen();
+    };
+    resultViewer.addEventListener('fullscreenchange', () => {
+      $('result-fullscreen').textContent = document.fullscreenElement === resultViewer ? '退出全屏' : '全屏查看';
+      if (resultView.fitMode) fitResult();
+    });
+    resultViewer.addEventListener('wheel', event => {
+      event.preventDefault();
+      const rect = resultViewer.getBoundingClientRect();
+      zoomResult(event.deltaY < 0 ? 1.2 : 1 / 1.2,
+                 event.clientX - rect.left, event.clientY - rect.top);
+    }, {passive: false});
+    resultViewer.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      resultViewer.setPointerCapture(event.pointerId);
+      resultView.drag = {x: event.clientX, y: event.clientY};
+      resultViewer.classList.add('dragging');
+    });
+    resultViewer.addEventListener('pointermove', event => {
+      if (!resultView.drag) return;
+      resultView.x += event.clientX - resultView.drag.x;
+      resultView.y += event.clientY - resultView.drag.y;
+      resultView.drag = {x: event.clientX, y: event.clientY};
+      resultView.fitMode = false;
+      drawResult();
+    });
+    for (const name of ['pointerup', 'pointercancel']) {
+      resultViewer.addEventListener(name, () => {
+        resultView.drag = null;
+        resultViewer.classList.remove('dragging');
+      });
+    }
+    new ResizeObserver(() => { if (resultView.fitMode) fitResult(); }).observe(resultViewer);
+
+    function formatApiDebug(data) {
+      const info = data.debug_info;
+      if (!info) return '当前 API 未返回阶段调试信息，请确认容器已加载最新代码。';
+      const lines = [
+        `算法：${data.algorithm}；输入图像：${info.image_count} 张`,
+        `输出：${data.output_width} × ${data.output_height}`,
+        '', '阶段进度：',
+      ];
+      for (const stage of info.stages || []) {
+        lines.push(`[${String(stage.index).padStart(2, '0')}/${stage.total}] ${stage.message}（${stage.percentage}% · ${stage.elapsed_seconds}s）`);
+      }
+      for (const pair of info.pair_diagnostics || []) {
+        lines.push(`图 ${pair.image_a+1}↔${pair.image_b+1}：${pair.region_source === 'selected' ? '框选' : '自动'}；${pair.status === 'refined' ? '配准成功' : '保留手工位置'}；匹配 ${pair.matches}，内点 ${pair.inliers}；${pair.reason || ''}`);
+        for (const region of pair.regions || []) lines.push(`  ${region.id || '自动区域'}：面积 ${region.area_a}/${region.area_b}；预算 ${region.budget_a}/${region.budget_b}；特征 ${region.features_a}/${region.features_b}；匹配 ${region.matches}，内点 ${region.inliers || 0}；${region.reason || ''}`);
+      }
+      lines.push('', '最终阶段耗时（累计）：');
+      for (const [name, timing] of Object.entries(info.timings || {})) {
+        lines.push(`${name}: ${timing.total_seconds}s（${timing.count} 次）`);
+      }
+      return lines.join('\n');
+    }
+
+    function showProgress() {
+      $('progress-bar').value = 0;
+      $('progress-percent').textContent = '0%';
+      $('progress-stage').textContent = '正在准备拼接请求…';
+      $('progress-overlay').hidden = false;
+    }
+
+    function updateProgress(data) {
+      if (!data.exists) return;
+      const percentage = Math.max(0, Math.min(100, Number(data.percentage) || 0));
+      $('progress-bar').value = percentage;
+      $('progress-percent').textContent = `${percentage.toFixed(1)}%`;
+      $('progress-stage').textContent = data.status || '正在拼接…';
+    }
+
+    $('run').onclick = async () => {
+      if (state.images.length < 2) {
+        $('status').className = 'error';
+        $('status').textContent = '请先读取至少两张图像。';
+        return;
+      }
+      const outputName = $('output-name').value.trim();
+      const finalMegapix = Number($('final-megapix').value);
+      if (!outputName || !Number.isFinite(finalMegapix) || finalMegapix === 0 || finalMegapix < -1) {
+        $('status').textContent = '请检查输出文件名和最终分辨率（正数或 -1）。';
+        $('status').className = 'error'; return;
+      }
+      const body = {images: state.images.map((item, index) => ({index,
+                      corners: item.corners.map(p => p.map(number))})),
+                    matching_regions: state.regions.map(r => ({id:r.id,rect:[...r.rect]})),
+                    output_name: outputName, final_megapix: finalMegapix,
+                    blender_type: $('blender-type').value};
+      $('run').disabled = true;
+      $('status').className = 'muted'; $('status').textContent = '正在调用拼接 API，请等待…';
+      $('result-panel').style.display = 'none'; $('result-info').textContent = '';
+      $('api-debug-details').style.display = 'none'; $('api-debug').textContent = '';
+      $('download-result').style.display = 'none';
+      showProgress();
+      let progressTimer = null;
+      try {
+        const baselineResponse = await fetch('/api/progress?baseline=1', {cache: 'no-store'});
+        if (!baselineResponse.ok) throw new Error('无法初始化进度查询');
+        const baseline = await baselineResponse.json();
+        let polling = false;
+        progressTimer = setInterval(async () => {
+          if (polling) return;
+          polling = true;
+          try {
+            const progressResponse = await fetch(`/api/progress?since=${encodeURIComponent(baseline.version)}`, {cache: 'no-store'});
+            if (progressResponse.ok) updateProgress(await progressResponse.json());
+          } catch (error) {
+            // 进度查询失败不应中断正在进行的拼接请求。
+          } finally { polling = false; }
+        }, 700);
+        const response = await fetch('/api/stitch', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        $('status').className = 'success';
+        const pairs = data.debug_info?.pair_diagnostics || [];
+        const refined = pairs.filter(pair => pair.status === 'refined').length;
+        $('status').textContent = `结果已生成：${data.output_width} × ${data.output_height} 像素，结果保存至 ${data.output_path}。配准成功 ${refined} 对，保留手工位置 ${pairs.length-refined} 对；详情见下方诊断。`;
+        $('result-panel').style.display = 'block';
+        resultImage.src = `${data.preview_url}?t=${Date.now()}`;
+        $('download-result').href = data.download_url;
+        $('download-result').style.display = 'inline';
+        $('result-info').textContent = `输出结果：${data.output_width} × ${data.output_height} 像素。Transform 矩阵已写入 TIFF/COG 元数据。`;
+        $('api-debug').textContent = formatApiDebug(data);
+        $('api-debug-details').style.display = 'block';
+        $('coordinates').textContent = JSON.stringify(data.submitted_payload, null, 2);
+      } catch (error) {
+        $('status').className = 'error'; $('status').textContent = `拼接失败：${error.message}`;
+        $('api-debug').textContent = `API 请求失败：${error.message}`;
+        $('api-debug-details').style.display = 'block';
+      } finally {
+        if (progressTimer !== null) clearInterval(progressTimer);
+        $('progress-overlay').hidden = true;
+        $('run').disabled = false;
+      }
+    };
+
+    function loadDescriptions(descriptors) {
+      state.images = descriptors.map(item => ({...item, corners: [], bitmap: null, initialX: 0}));
+      state.selected = state.images.length > 1 ? 1 : 0;
+      const list = $('image-list');
+      list.replaceChildren();
+      state.images.forEach((item, index) => {
+        const button = document.createElement('button'); button.className = 'image-item';
+        const title = document.createElement('span'); title.textContent = `${index + 1}. ${item.name}`;
+        const size = document.createElement('small'); size.textContent = `${item.width}×${item.height}`;
+        button.append(title, size); button.onclick = () => { state.selected = index; updateSelection(); };
+        list.appendChild(button);
+        const bitmap = new Image();
+        bitmap.onload = () => { item.bitmap = bitmap; draw(); };
+        bitmap.onerror = () => { $('status').className = 'error'; $('status').textContent = `无法加载 ${item.name} 的预览`; };
+        bitmap.src = item.preview_url;
+      });
+      resetPositions();
+      updateSelection();
+    }
+
+    $('load-images').onclick = async () => {
+      const files = Array.from($('image-files').files || []);
+      if (files.length < 2) {
+        $('status').className = 'error'; $('status').textContent = '请一次选择至少两张图片。';
+        return;
+      }
+      const form = new FormData();
+      files.forEach(file => form.append('images', file));
+      $('load-images').disabled = true;
+      $('status').className = 'muted'; $('status').textContent = '正在读取图片，请等待…';
+      try {
+        const response = await fetch('/api/images', {method: 'POST', body: form});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        loadDescriptions(data.images);
+        $('result-panel').style.display = 'none'; $('result-info').textContent = '';
+        $('api-debug-details').style.display = 'none'; $('api-debug').textContent = '';
+        $('download-result').style.display = 'none';
+        $('status').className = 'success';
+        $('status').textContent = `已读取 ${data.images.length} 张图片；第一张图固定在 (0, 0)。`;
+      } catch (error) {
+        $('status').className = 'error'; $('status').textContent = `读取失败：${error.message}`;
+      } finally { $('load-images').disabled = false; }
+    };
+
+    loadDescriptions(descriptions);
+    new ResizeObserver(resizeCanvas).observe(workspace);
+  </script>
+</body>
+</html>
