@@ -283,6 +283,9 @@ def _run_headless_stitch(options: Dict[str, Any]) -> Dict[str, Any]:
         response["debug_info"] = result_context["debug_info"]
         if "pair_diagnostics" in result_context:
             response["debug_info"]["pair_diagnostics"] = result_context["pair_diagnostics"]
+    if "registration_status" in result_context:
+        response["registration_status"] = result_context["registration_status"]
+        response["image_diagnostics"] = result_context["image_diagnostics"]
     return response
 
 

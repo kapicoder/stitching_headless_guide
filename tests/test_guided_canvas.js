@@ -162,3 +162,35 @@ assert.equal(state.regions.length,1);
 element('reset').onclick();
 assert.equal(state.regions.length,0);
 console.log('Region pair associations and reset OK');
+
+// A smaller moving image uses its own canvas short side for the search margin.
+state.images[1].corners = [[208,0],[308,0],[308,60],[208,60]];
+assert.equal(vm.runInNewContext('regionPairs({rect:[195,0,30,60]}).length',sandbox),0);
+const partialDebug = sandbox.testFormatApiDebug({
+  algorithm: 'guided_affine', registration_status: 'partial',
+  output_width: 500, output_height: 900,
+  image_diagnostics: [{image_index: 2, status: 'fallback_initial', reason: '没有通过可靠匹配连接到第一张参考图'}],
+  debug_info: {image_count: 3, stages: [], timings: {}},
+});
+assert.match(partialDebug, /部分配准/);
+assert.match(partialDebug, /图 3：保留人工位置/);
+
+// File-generation success must not be presented as successful registration.
+(async () => {
+  element('output-name').value = 'result.png';
+  element('final-megapix').value = '1';
+  sandbox.setInterval = () => 1;
+  sandbox.clearInterval = () => {};
+  for (const [status, text] of [['full','完整配准'], ['partial','部分配准'], ['manual_only','仅按人工布局合成']]) {
+    sandbox.fetch = async url => ({ok: true, json: async () => url.includes('baseline=1') ? {version: '0'} : {
+      registration_status: status, output_width: 500, output_height: 900,
+      output_path: '/output/result.png', preview_url: '/result/result.png', download_url: '/download/result.png',
+      debug_info: {stages: [], timings: {}, pair_diagnostics: []},
+    }});
+    await element('run').onclick();
+    assert.match(element('status').textContent, new RegExp(text));
+    assert.equal(element('status').className, status === 'full' ? 'success' : 'muted');
+    assert.equal(element('result-panel').style.display, 'block');
+  }
+  console.log('Registration status, fallback display and pair margins OK');
+})().catch(error => {console.error(error); process.exitCode = 1;});

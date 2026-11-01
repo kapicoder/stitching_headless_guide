@@ -264,7 +264,8 @@ def create_app(
                 output_name in {".", ".."} or Path(output_name).suffix.lower() not in OUTPUT_SUFFIXES):
             return jsonify({"error": "结果文件名只能是 output 目录中的 JPG、PNG 或 TIFF 文件名"}), 400
         settings = {"algorithm": "guided_affine", "georef_mode": "none"}
-        for key in ("final_megapix", "medium_megapix", "low_megapix", "blender_type"):
+        for key in ("final_megapix", "medium_megapix", "low_megapix", "blender_type",
+                    "guided_ransac_threshold_px"):
             if key in body:
                 settings[key] = body[key]
         payload = {"images": guided_images, "matching_regions": matching_regions, "output_path": f"/workspace/output/{output_name}",

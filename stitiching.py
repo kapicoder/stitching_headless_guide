@@ -123,6 +123,7 @@ def stitch_images(
                 result_context["projection"] = projection
                 result_context["georeference_method"] = metadata["method"]
             result_context["pair_diagnostics"] = stitcher.pair_diagnostics
+            result_context.update(stitcher.geometry.registration_info())
             result_context["output_source"] = "algorithm_blended"
             result_context["fusion_method"] = settings["blender_type"]
             result_context["debug_info"] = stitcher.debug_info()

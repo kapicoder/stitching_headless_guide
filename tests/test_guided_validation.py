@@ -9,8 +9,26 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image
+import pytest
 
 import guided_validation
+
+
+@pytest.fixture(autouse=True)
+def test_project(tmp_path, monkeypatch):
+    """Use small generated TIFFs instead of depending on local aerial datasets."""
+    templates = guided_validation.PROJECT_ROOT / "validation_templates"
+    (tmp_path / "validation_templates").symlink_to(templates, target_is_directory=True)
+    folder = tmp_path / "test_data" / "aerial_4000x24000"
+    folder.mkdir(parents=True)
+    for index in (1, 2):
+        Image.new("RGB", (400, 240), "gray").save(folder / f"aerial_0{index}.tif")
+    output = tmp_path / "output"
+    output.mkdir()
+    monkeypatch.setattr(guided_validation, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(guided_validation, "OUTPUT_ROOT", output)
+    monkeypatch.setattr(guided_validation, "UPLOAD_ROOT", output / "guided_uploads")
+    monkeypatch.chdir(tmp_path)
 
 
 def _app():
@@ -22,8 +40,8 @@ def _app():
 
 def _positions():
     return [
-        {"index": 0, "corners": [[0, 0], [4000, 0], [4000, 24000], [0, 24000]]},
-        {"index": 1, "corners": [[3000, 0], [7000, 0], [7000, 24000], [3000, 24000]]},
+        {"index": 0, "corners": [[0, 0], [400, 0], [400, 240], [0, 240]]},
+        {"index": 1, "corners": [[300, 0], [700, 0], [700, 240], [300, 240]]},
     ]
 
 
@@ -67,7 +85,7 @@ def test_proxy_uses_container_paths_and_submits_four_corners(monkeypatch):
     monkeypatch.setattr(guided_validation, "build_opener", lambda handler: FakeOpener())
     response = _app().test_client().post("/api/stitch", json={
         "images": _positions(), "output_name": "manual_result.tif",
-        "final_megapix": 2, "blender_type": "feather",
+        "final_megapix": 2, "blender_type": "feather", "guided_ransac_threshold_px": 2.5,
         "matching_regions": [{"id":"a", "rect":[3000,0,1000,24000]}],
     })
     assert response.status_code == 200
@@ -79,6 +97,7 @@ def test_proxy_uses_container_paths_and_submits_four_corners(monkeypatch):
     assert payload["output_path"] == "/workspace/output/manual_result.tif"
     assert payload["settings"]["algorithm"] == "guided_affine"
     assert payload["settings"]["georef_mode"] == "none"
+    assert payload["settings"]["guided_ransac_threshold_px"] == 2.5
     assert response.get_json()["preview_url"] == "/result/manual_result.tif"
     assert response.get_json()["download_url"] == "/download/manual_result.tif"
 

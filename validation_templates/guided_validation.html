@@ -261,9 +261,11 @@
       },0))/2;
     }
     function regionPairs(region) {
-      const pairs = [], margin = state.images.length ? .1*Math.min(state.images[0].width,state.images[0].height) : 0;
+      const pairs = [];
       for (let i=0;i<state.images.length;i++) for (let j=i+1;j<state.images.length;j++) {
         const a = state.images[i].corners, b = state.images[j].corners;
+        const shortSide = quad => Math.min(...quad.map((p,k) => Math.hypot(p[0]-quad[(k+1)%4][0],p[1]-quad[(k+1)%4][1])));
+        const margin = .1*Math.min(shortSide(a),shortSide(b));
         const sa = clipPolygon(a,b,margin), sb = clipPolygon(b,a,margin);
         if (Math.min(polygonArea(sa),polygonArea(sb)) < 100) continue;
         const rect = rectCorners(region.rect);
@@ -546,13 +548,19 @@
       const lines = [
         `算法：${data.algorithm}；输入图像：${info.image_count} 张`,
         `输出：${data.output_width} × ${data.output_height}`,
-        '', '阶段进度：',
+        `配准状态：${registrationLabel(data.registration_status)}`,
       ];
+      for (const image of data.image_diagnostics || []) {
+        const label = image.status === 'reference' ? '固定参考图' : image.status === 'refined' ? '精配准成功' : '保留人工位置';
+        lines.push(`图 ${image.image_index+1}：${label}；${image.reason || ''}`);
+      }
+      lines.push('', '阶段进度：');
       for (const stage of info.stages || []) {
         lines.push(`[${String(stage.index).padStart(2, '0')}/${stage.total}] ${stage.message}（${stage.percentage}% · ${stage.elapsed_seconds}s）`);
       }
       for (const pair of info.pair_diagnostics || []) {
-        lines.push(`图 ${pair.image_a+1}↔${pair.image_b+1}：${pair.region_source === 'selected' ? '框选' : '自动'}；${pair.status === 'refined' ? '配准成功' : '保留手工位置'}；匹配 ${pair.matches}，内点 ${pair.inliers}；${pair.reason || ''}`);
+        lines.push(`图 ${pair.image_a+1}↔${pair.image_b+1}：${pair.region_source === 'selected' ? '框选' : '自动'}；${pair.status === 'refined' ? '配准成功' : '未用于精配准'}；特征 ${pair.features_a}/${pair.features_b}；匹配 ${pair.matches}，内点 ${pair.inliers}；${pair.reason || ''}`);
+        if (pair.rmse_pixels != null) lines.push(`  拟合 RMSE：${pair.rmse_pixels.toFixed(3)} 个图 ${pair.image_a+1} 的特征图像素；RANSAC 阈值：${pair.ransac_threshold_px}`);
         for (const region of pair.regions || []) lines.push(`  ${region.id || '自动区域'}：面积 ${region.area_a}/${region.area_b}；预算 ${region.budget_a}/${region.budget_b}；特征 ${region.features_a}/${region.features_b}；匹配 ${region.matches}，内点 ${region.inliers || 0}；${region.reason || ''}`);
       }
       lines.push('', '最终阶段耗时（累计）：');
@@ -560,6 +568,10 @@
         lines.push(`${name}: ${timing.total_seconds}s（${timing.count} 次）`);
       }
       return lines.join('\n');
+    }
+
+    function registrationLabel(status) {
+      return {full: '完整配准', partial: '部分配准，其余保留人工位置', manual_only: '仅按人工布局合成，未完成自动配准'}[status] || '未返回配准状态';
     }
 
     function showProgress() {
@@ -619,10 +631,10 @@
         const response = await fetch('/api/stitch', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-        $('status').className = 'success';
+        $('status').className = data.registration_status === 'full' ? 'success' : 'muted';
         const pairs = data.debug_info?.pair_diagnostics || [];
         const refined = pairs.filter(pair => pair.status === 'refined').length;
-        $('status').textContent = `结果已生成：${data.output_width} × ${data.output_height} 像素，结果保存至 ${data.output_path}。配准成功 ${refined} 对，保留手工位置 ${pairs.length-refined} 对；详情见下方诊断。`;
+        $('status').textContent = `${registrationLabel(data.registration_status)}。结果：${data.output_width} × ${data.output_height} 像素，保存至 ${data.output_path}。成功用于精配准 ${refined} 对；详情见下方诊断。`;
         $('result-panel').style.display = 'block';
         resultImage.src = `${data.preview_url}?t=${Date.now()}`;
         $('download-result').href = data.download_url;

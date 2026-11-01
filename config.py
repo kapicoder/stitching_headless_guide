@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -16,6 +17,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     
     "detector": "sift",
     "nfeatures": 4000,
+    # 人工引导配准：外扩距离使用每对图像在画布中的较小短边。
+    "guided_min_overlap_pixels": 100,
+    "guided_overlap_margin_ratio": 0.10,
+    "guided_min_inliers": 8,
+    # RANSAC 误差使用目标特征图像素，不使用画布单位。
+    "guided_ransac_threshold_px": 3.0,
     "match_conf": 0.65,
     "confidence_threshold": 0.3,
     
@@ -179,11 +186,13 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
     for key in {
         "nfeatures", "range_width", "image_io_workers", "apap_grid_parts", "apap_min_matches",
         "apap_blend_width",
+        "guided_min_overlap_pixels", "guided_min_inliers",
     }:
         settings[key] = int(settings[key])
     for key in {
         "match_conf", "confidence_threshold", "medium_megapix", "low_megapix",
         "final_megapix", "apap_sigma",
+        "guided_overlap_margin_ratio", "guided_ransac_threshold_px",
     }:
         settings[key] = float(settings[key])
     settings["crop"] = _as_bool(settings["crop"])
@@ -198,6 +207,13 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
     if settings["nfeatures"] <= 0:
         raise ValueError("nfeatures 必须大于0")
+    if settings["guided_min_overlap_pixels"] < 1 or settings["guided_min_inliers"] < 3:
+        raise ValueError("guided_min_overlap_pixels 必须大于0，guided_min_inliers 必须至少为3")
+    if not 0 <= settings["guided_overlap_margin_ratio"] <= 1:
+        raise ValueError("guided_overlap_margin_ratio 必须在 0 到 1 之间")
+    if (not math.isfinite(settings["guided_ransac_threshold_px"])
+            or settings["guided_ransac_threshold_px"] <= 0):
+        raise ValueError("guided_ransac_threshold_px 必须是大于0的有限数值")
     if not 0 < settings["match_conf"] <= 1:
         raise ValueError("match_conf 必须大于0且小于等于1")
     if settings["range_width"] != -1 and settings["range_width"] < 1:

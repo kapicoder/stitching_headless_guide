@@ -62,6 +62,26 @@ def test_weak_texture_keeps_manual_position_and_negative_offset(tmp_path):
     assert stitcher.pair_diagnostics[0]["status"] == "fallback_initial"
 
 
+def test_guided_match_supports_shear_and_nonuniform_scale(tmp_path):
+    first, second = _write_pair(tmp_path)
+    images = _images(first, second, 170)
+    initial = np.array([[1.2, 0.25, 170.0], [0.0, 0.8, 0.0]])
+    source_corners = np.array([[0, 0], [250, 0], [250, 180], [0, 180]])
+    images[1]["corners"] = (
+        source_corners @ initial[:, :2].T + initial[:, 2]
+    ).tolist()
+    stitcher = GuidedAffineStitcher(show_progress=False)
+
+    items = stitcher.register(images)
+
+    diagnostics = stitcher.pair_diagnostics[0]
+    assert diagnostics["status"] == "refined"
+    assert diagnostics["inliers"] >= 0.9 * diagnostics["matches"]
+    assert diagnostics["rmse_pixels"] < 1.0
+    actual = source_corners @ items[1]["matrix"][:, :2].T + items[1]["matrix"][:, 2]
+    np.testing.assert_allclose(actual, source_corners + [170, 0], atol=1.0)
+
+
 def test_feature_mask_is_confined_to_overlap(tmp_path):
     first, second = _write_pair(tmp_path)
     items = validate_images(_images(first, second, 170))
@@ -132,8 +152,10 @@ def test_invalid_geometry_and_no_overlap(tmp_path):
     with pytest.raises(ValueError, match="仿射"):
         validate_images(images)
     images = _images(first, second, 400)
-    with pytest.raises(ValueError, match="没有重叠"):
-        GuidedAffineStitcher(show_progress=False).stitch(images)
+    stitcher = GuidedAffineStitcher(show_progress=False)
+    items = stitcher.register(images)
+    assert stitcher.registration_status == "manual_only"
+    np.testing.assert_array_equal(items[1]["matrix"], items[1]["initial_matrix"])
 
 
 def test_api_returns_compact_result_and_debug_info(tmp_path):
@@ -156,7 +178,10 @@ def test_api_returns_compact_result_and_debug_info(tmp_path):
     assert set(data) == {
         "status", "output_path", "progress_path", "image_count", "valid_paths",
         "output_width", "output_height", "algorithm", "cog", "settings", "debug_info",
+        "registration_status", "image_diagnostics",
     }
+    assert data["registration_status"] == "manual_only"
+    assert data["image_diagnostics"][1]["status"] == "fallback_initial"
     stages = data["debug_info"]["stages"]
     assert len(stages) == 17
     assert stages[-1]["index"] == stages[-1]["total"] == 17

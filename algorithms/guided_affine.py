@@ -9,15 +9,16 @@ from typing import Any
 import cv2
 import numpy as np
 
+from config import DEFAULT_SETTINGS
 from image_io import get_input_image_size, read_input_image_with_size, read_valid_mask
 from progress import write_progress
 
 
 GUIDED_DEFAULT_SETTINGS: dict[str, Any] = {
-    "guided_min_overlap_pixels": 100,
-    # 重叠区外扩半径 = 第一张图较短边的 10%。
-    "guided_overlap_margin_ratio": 0.10,
-    "guided_min_inliers": 8,
+    key: DEFAULT_SETTINGS[key] for key in (
+        "guided_min_overlap_pixels", "guided_overlap_margin_ratio",
+        "guided_min_inliers", "guided_ransac_threshold_px",
+    )
 }
 
 # GuidedAffineStitcher 能直接接收的设置；由拼接分派层据此过滤全局配置。
@@ -26,6 +27,7 @@ GUIDED_SETTING_KEYS = {
     "final_megapix", "finder", "compensator", "blender_type",
     "blend_strength", "crop", "guided_min_overlap_pixels",
     "guided_overlap_margin_ratio", "guided_min_inliers",
+    "guided_ransac_threshold_px",
 }
 
 
@@ -64,13 +66,6 @@ def build_guided_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if algorithm != "guided_affine":
         raise ValueError("人工四角配置必须设置 algorithm=guided_affine")
     result["algorithm"] = algorithm
-    result["guided_min_overlap_pixels"] = int(settings["guided_min_overlap_pixels"])
-    result["guided_min_inliers"] = int(settings["guided_min_inliers"])
-    result["guided_overlap_margin_ratio"] = float(settings["guided_overlap_margin_ratio"])
-    if result["guided_min_overlap_pixels"] < 1 or result["guided_min_inliers"] < 3:
-        raise ValueError("guided_min_overlap_pixels 必须大于0，guided_min_inliers 必须至少为3")
-    if not 0 <= result["guided_overlap_margin_ratio"] <= 1:
-        raise ValueError("guided_overlap_margin_ratio 必须在 0 到 1 之间")
     return result
 
 
@@ -155,9 +150,12 @@ class GuidedAffineStitcher:
         self, *, detector="sift", nfeatures=4000, medium_megapix=2,
         low_megapix=0.3, final_megapix=10, finder="dp_color",
         compensator="channel_blocks", blender_type="multiband",
-        blend_strength=1, crop=True, guided_min_overlap_pixels=100,
-        guided_overlap_margin_ratio=0.10,
-        guided_min_inliers=8, show_progress=True, output_path=None,
+        blend_strength=1, crop=True,
+        guided_min_overlap_pixels=GUIDED_DEFAULT_SETTINGS["guided_min_overlap_pixels"],
+        guided_overlap_margin_ratio=GUIDED_DEFAULT_SETTINGS["guided_overlap_margin_ratio"],
+        guided_min_inliers=GUIDED_DEFAULT_SETTINGS["guided_min_inliers"],
+        guided_ransac_threshold_px=GUIDED_DEFAULT_SETTINGS["guided_ransac_threshold_px"],
+        show_progress=True, output_path=None,
         matching_regions=None,
     ) -> None:
         self.matching_regions = validate_matching_regions(matching_regions)
@@ -174,11 +172,16 @@ class GuidedAffineStitcher:
         self.min_overlap = int(guided_min_overlap_pixels)
         self.overlap_margin_ratio = float(guided_overlap_margin_ratio)
         self.min_inliers = int(guided_min_inliers)
+        self.ransac_threshold_px = float(guided_ransac_threshold_px)
+        if not math.isfinite(self.ransac_threshold_px) or self.ransac_threshold_px <= 0:
+            raise ValueError("guided_ransac_threshold_px 必须是大于0的有限数值")
         self.show_progress = show_progress
         self.output_path = output_path
         self.output_offset = [0.0, 0.0]
         self.output_scale = 1.0
         self.pair_diagnostics: list[dict[str, Any]] = []
+        self.registration_status = "manual_only"
+        self.image_diagnostics: list[dict[str, Any]] = []
 
     def _log(self, message: str, percentage: float) -> None:
         write_progress(self.output_path, percentage, message)
@@ -210,6 +213,25 @@ class GuidedAffineStitcher:
         quad_b = _points(b["matrix"], _corners(b["size"])).astype(np.float32)
         area, polygon = cv2.intersectConvexConvex(quad_a, quad_b)
         return float(area), polygon.reshape(-1, 2) if polygon is not None else np.empty((0, 2))
+
+    def _pair_margin(self, a: dict, b: dict) -> float:
+        """Use transformed edge lengths, so the margin is in canvas units."""
+        short_sides = []
+        for item in (a, b):
+            quad = _points(item["matrix"], _corners(item["size"]))
+            short_sides.append(np.linalg.norm(np.roll(quad, -1, axis=0) - quad, axis=1).min())
+        return float(self.overlap_margin_ratio * min(short_sides))
+
+    @staticmethod
+    def _mutual_matches(desc_a: np.ndarray, desc_b: np.ndarray, norm: int) -> list[cv2.DMatch]:
+        """Require the ratio test in both directions and a reciprocal match."""
+        matcher = cv2.BFMatcher(norm)
+        forward = [pair[0] for pair in matcher.knnMatch(desc_a, desc_b, k=2)
+                   if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance]
+        reverse = {(pair[0].trainIdx, pair[0].queryIdx)
+                   for pair in matcher.knnMatch(desc_b, desc_a, k=2)
+                   if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance}
+        return [match for match in forward if (match.queryIdx, match.trainIdx) in reverse]
 
     @staticmethod
     def _expanded_quad(quad: np.ndarray, margin: float) -> np.ndarray:
@@ -304,6 +326,8 @@ class GuidedAffineStitcher:
         budgets_b = [self.nfeatures if area else 0 for area in areas_b]
         info = {"features_a": 0, "features_b": 0, "matches": 0,
                 "inliers": 0, "rmse_pixels": None, "status": "fallback_initial",
+                "error_coordinate_system": "image_a_medium_pixels",
+                "ransac_threshold_px": self.ransac_threshold_px,
                 "region_source": "selected" if selected else "automatic", "regions": []}
         all_a, all_b, owners = [], [], []
         for index, (identifier, _, _) in enumerate(regions):
@@ -333,9 +357,7 @@ class GuidedAffineStitcher:
             if desc_a is None or desc_b is None or len(desc_a) < 2 or len(desc_b) < 2:
                 detail["reason"] = "区域无有效像素" if not areas_a[index] or not areas_b[index] else "区域特征不足"
                 continue
-            matches = cv2.BFMatcher(norm).knnMatch(desc_a, desc_b, k=2)
-            good = [first for pair in matches if len(pair) == 2
-                    for first, second in [pair] if first.distance < 0.75 * second.distance]
+            good = self._mutual_matches(desc_a, desc_b, norm)
             detail["matches"] = len(good)
             if not good:
                 detail["reason"] = "描述子匹配不足"
@@ -351,19 +373,15 @@ class GuidedAffineStitcher:
             _, unique = np.unique(np.round(np.column_stack((pa, pb)), 4), axis=0, return_index=True)
         pa, pb = pa[unique], pb[unique]
         owners = np.asarray(owners)[unique]
-        pa *= [a["size"][0] / a["medium"].shape[1], a["size"][1] / a["medium"].shape[0]]
-        pb *= [b["size"][0] / b["medium"].shape[1], b["size"][1] / b["medium"].shape[0]]
-        world_a = _points(a["matrix"], pa)
-        world_b = _points(b["matrix"], pb)
-        info["matches"] = len(world_a)
-        if len(world_a) < self.min_inliers:
+        info["matches"] = len(pa)
+        if len(pa) < self.min_inliers:
             info["reason"] = "描述子匹配点不足"
             return info, None
-        relative, inlier_mask = cv2.estimateAffinePartial2D(
-            world_b, world_a, method=cv2.RANSAC, ransacReprojThreshold=4.0,
+        relative, inlier_mask = cv2.estimateAffine2D(
+            pb, pa, method=cv2.RANSAC, ransacReprojThreshold=self.ransac_threshold_px,
             maxIters=2000, confidence=0.995,
         )
-        if relative is None or inlier_mask is None:
+        if relative is None or inlier_mask is None or not self._valid_affine(relative):
             info["reason"] = "RANSAC 估计失败"
             return info, None
         active = inlier_mask.ravel().astype(bool)
@@ -375,57 +393,117 @@ class GuidedAffineStitcher:
         if info["inliers"] < self.min_inliers:
             info["reason"] = "RANSAC 内点不足"
             return info, None
-        corrected = _points(relative, world_b[active])
-        info["rmse_pixels"] = float(np.sqrt(np.mean(np.sum((corrected - world_a[active]) ** 2, axis=1))))
+        corrected = _points(relative, pb[active])
+        info["rmse_pixels"] = float(np.sqrt(np.mean(np.sum((corrected - pa[active]) ** 2, axis=1))))
+        pa *= [a["size"][0] / a["medium"].shape[1], a["size"][1] / a["medium"].shape[0]]
+        pb *= [b["size"][0] / b["medium"].shape[1], b["size"][1] / b["medium"].shape[0]]
+        world_a = _points(a["matrix"], pa)
+        world_b = _points(b["matrix"], pb)
         info["status"] = "matched"
         return info, (world_a[active], world_b[active])
 
+    @staticmethod
+    def _valid_affine(matrix: np.ndarray) -> bool:
+        if not np.isfinite(matrix).all():
+            return False
+        singular = np.linalg.svd(matrix[:, :2], compute_uv=False)
+        return bool(np.linalg.det(matrix[:, :2]) > 0
+                    and singular[-1] > 1e-8 * singular[0])
+
+    @staticmethod
+    def _reference_component(pairs: list[tuple], excluded: set[int] | tuple[int, ...] = ()) -> set[int]:
+        adjacency: dict[int, set[int]] = {}
+        for i, j, *_ in pairs:
+            if i not in excluded and j not in excluded:
+                adjacency.setdefault(i, set()).add(j)
+                adjacency.setdefault(j, set()).add(i)
+        connected, pending = {0}, [0]
+        while pending:
+            for index in adjacency.get(pending.pop(), set()) - connected:
+                connected.add(index)
+                pending.append(index)
+        return connected
+
     def _global_adjust(self, items: list[dict], pairs: list[tuple]) -> None:
-        if not pairs:
-            return
-        # 每张非锚点图的六个参数表示在初始画布坐标上的仿射残差。
-        count = 6 * (len(items) - 1)
-        rows, rhs = [], []
-        centers = [np.mean(_points(item["matrix"], _corners(item["size"])), axis=0) for item in items]
-        spans = [max(item["size"]) for item in items]
+        # Solve dimensionless residuals, with a weak positional prior at all four
+        # corners. Its strength is independent of raw image and canvas sizes.
+        quads = [_points(item["initial_matrix"], _corners(item["size"])) for item in items]
+        centers = [quad.mean(axis=0) for quad in quads]
+        spans = [float(np.linalg.norm(np.roll(quad, -1, axis=0) - quad, axis=1).max())
+                 for quad in quads]
+        unit = spans[0]
+        excluded: set[int] = set()
+        items[0]["correction_status"] = "reference"
+        for item in items[1:]:
+            item["correction_reason"] = "没有通过可靠匹配连接到第一张参考图"
 
         def basis(index, point):
             x, y = (point - centers[index]) / spans[index]
             return np.array([[1, 0, x, y, 0, 0], [0, 1, 0, 0, x, y]], np.float64)
 
-        for i, j, pa, pb in pairs:
-            step = max(1, len(pa) // 150)
-            for point_a, point_b in zip(pa[::step], pb[::step]):
-                block = np.zeros((2, count), np.float64)
-                if i:
-                    block[:, 6 * (i - 1):6 * i] = basis(i, point_a)
-                if j:
-                    block[:, 6 * (j - 1):6 * j] -= basis(j, point_b)
-                rows.extend(block)
-                rhs.extend(point_b - point_a)
-        for index in range(1, len(items)):
-            for param in range(6):
-                regularizer = np.zeros(count)
-                regularizer[6 * (index - 1) + param] = 0.2 if param < 2 else 1.0
-                rows.append(regularizer)
-                rhs.append(0.0)
-        solution, _, _, _ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
-        for index, item in enumerate(items[1:], 1):
-            tx, ty, ax, bx, ay, by = solution[6 * (index - 1):6 * index]
-            center = centers[index]
-            span = spans[index]
-            correction = np.array([
-                [1 + ax / span, bx / span, tx - (ax * center[0] + bx * center[1]) / span],
-                [ay / span, 1 + by / span, ty - (ay * center[0] + by * center[1]) / span],
-            ])
-            if not np.isfinite(correction).all() or np.linalg.det(correction[:, :2]) <= 0:
-                item["correction_status"] = "fallback_initial"
+        # If a transform is invalid, remove it and solve the remaining anchored
+        # component again; a failed bridge must not leave detached images refined.
+        while True:
+            connected = self._reference_component(pairs, excluded)
+            variables = {index: slot for slot, index in enumerate(sorted(connected - {0}))}
+            if not variables:
+                return
+            count = 6 * len(variables)
+            rows, rhs = [], []
+            for i, j, pa, pb in pairs:
+                if i not in connected or j not in connected:
+                    continue
+                sample = np.linspace(0, len(pa) - 1, min(len(pa), 150), dtype=int)
+                for point_a, point_b in zip(pa[sample], pb[sample]):
+                    block = np.zeros((2, count), np.float64)
+                    for index, point, sign in ((i, point_a, 1), (j, point_b, -1)):
+                        if index in variables:
+                            slot = variables[index]
+                            block[:, 6 * slot:6 * (slot + 1)] = (
+                                sign * spans[index] / unit * basis(index, point)
+                            )
+                    rows.extend(block)
+                    rhs.extend((point_b - point_a) / unit)
+            for index, slot in variables.items():
+                for corner in quads[index]:
+                    block = np.zeros((2, count), np.float64)
+                    block[:, 6 * slot:6 * (slot + 1)] = 0.01 * basis(index, corner)
+                    rows.extend(block)
+                    rhs.extend((0.0, 0.0))
+            try:
+                solution, _, _, _ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
+            except np.linalg.LinAlgError:
+                for index in variables:
+                    items[index]["correction_reason"] = "全局位置优化求解失败，保留人工位置"
+                return
+            candidates, invalid = {}, set()
+            for index, slot in variables.items():
+                tx, ty, ax, bx, ay, by = solution[6 * slot:6 * (slot + 1)]
+                linear = np.array([[1 + ax, bx], [ay, 1 + by]])
+                translation = spans[index] * np.array([tx, ty]) + centers[index] - linear @ centers[index]
+                initial = items[index]["initial_matrix"]
+                matrix = np.column_stack((linear @ initial[:, :2],
+                                          linear @ initial[:, 2] + translation))
+                if not self._valid_affine(matrix):
+                    invalid.add(index)
+                    items[index]["correction_reason"] = "全局优化产生无效仿射变换，保留人工位置"
+                else:
+                    candidates[index] = matrix
+            if invalid:
+                excluded.update(invalid)
                 continue
-            item["matrix"] = correction[:, :2] @ item["initial_matrix"][:, :2]
-            item["matrix"] = np.column_stack((
-                item["matrix"], correction[:, :2] @ item["initial_matrix"][:, 2] + correction[:, 2]
-            ))
-            item["correction_status"] = "refined"
+            for index, matrix in candidates.items():
+                items[index]["matrix"] = matrix
+                items[index]["correction_status"] = "refined"
+                items[index].pop("correction_reason", None)
+            return
+
+    def registration_info(self) -> dict[str, Any]:
+        """Return registration quality independently of file-generation success."""
+        return {
+            "registration_status": self.registration_status,
+            "image_diagnostics": self.image_diagnostics,
+        }
 
     @staticmethod
     def _bounds(items: list[dict], scale: float):
@@ -511,18 +589,16 @@ class GuidedAffineStitcher:
                                                   (item["medium"].shape[1], item["medium"].shape[0]))
             item["correction_status"] = "fallback_initial"
         _, norm = self._detector()
-        margin = self.overlap_margin_ratio * min(items[0]["size"])
-        linked = {0}
         accepted = []
         self._log("检测重叠区特征并匹配", 30.0)
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
+                margin = self._pair_margin(items[i], items[j])
                 area, search_area, polygon_a, polygon_b = self._search_polygons(
                     items[i], items[j], margin,
                 )
                 if search_area < self.min_overlap:
                     continue
-                linked.update((i, j))
                 info, match = self._match_pair(items[i], items[j], polygon_a, polygon_b, norm)
                 self.pair_diagnostics.append({"image_a": i, "image_b": j,
                                               "overlap_pixels": round(area, 2),
@@ -533,18 +609,31 @@ class GuidedAffineStitcher:
         for item in items:
             item.pop("medium")
             item.pop("medium_mask")
-        if len(linked) != len(items):
-            missing = sorted(set(range(len(items))) - linked)
-            raise ValueError(f"以下图片与其他图片没有重叠: {missing}")
         self._global_adjust(items, accepted)
         self._log("完成全局位置修正", 50.0)
+        registered = {index for index, item in enumerate(items)
+                      if item["correction_status"] in {"reference", "refined"}}
         for record in self.pair_diagnostics:
             if record["status"] == "matched":
-                if items[record["image_a"]]["correction_status"] == "refined" or items[record["image_b"]]["correction_status"] == "refined":
+                if record["image_a"] in registered and record["image_b"] in registered:
                     record["status"] = "refined"
                 else:
                     record["status"] = "fallback_initial"
-                    record["reason"] = "全局位置优化未能得到有效修正"
+                    record["reason"] = "未连接到参考图或全局修正无效，保留人工位置"
+        if len(registered) == len(items):
+            self.registration_status = "full"
+        elif len(registered) > 1:
+            self.registration_status = "partial"
+        else:
+            self.registration_status = "manual_only"
+        self.image_diagnostics = [
+            {"image_index": index, "path": item["path"],
+             "status": item["correction_status"],
+             "reason": item.get("correction_reason", ""),
+             "initial_transform": item["initial_matrix"].tolist(),
+             "final_transform": item["matrix"].tolist()}
+            for index, item in enumerate(items)
+        ]
         return items
 
     def stitch(self, images: list[dict[str, Any]]) -> np.ndarray:
