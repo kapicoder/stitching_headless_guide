@@ -71,7 +71,8 @@ def test_guided_match_supports_shear_and_nonuniform_scale_when_limits_allow(tmp_
         source_corners @ initial[:, :2].T + initial[:, 2]
     ).tolist()
     stitcher = GuidedAffineStitcher(
-        show_progress=False, guided_max_translation_ratio=0.5,
+        show_progress=False, guided_transform_model="affine",
+        guided_max_translation_ratio=0.5,
         guided_max_rotation_degrees=15, guided_max_scale_change=0.5, guided_max_shear=0.5,
     )
 
@@ -144,6 +145,7 @@ def test_large_visual_correction_keeps_manual_layout(tmp_path):
     first, second = _write_pair(tmp_path)
     stitcher = GuidedAffineStitcher(
         show_progress=False, final_megapix=-1,
+        guided_transform_model="affine",
         guided_refinement_limits_enabled=True,
     )
     panorama = stitcher.stitch(_images(first, second, 195))
@@ -186,10 +188,11 @@ def test_api_returns_compact_result_and_debug_info(tmp_path, capsys):
     assert set(data) == {
         "status", "output_path", "progress_path", "image_count", "valid_paths",
         "output_width", "output_height", "algorithm", "cog", "settings", "debug_info",
-        "registration_status", "image_diagnostics",
+        "registration_status", "transform_model", "image_diagnostics",
         "refinement_limits_enabled", "refinement_limits",
     }
     assert data["registration_status"] == "manual_only"
+    assert data["transform_model"] == "homography"
     assert data["refinement_limits_enabled"] is False
     assert data["image_diagnostics"][1]["status"] == "fallback_initial"
     assert data["debug_info"]["seam_mesh"]["enabled"] is True

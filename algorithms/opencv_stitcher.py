@@ -19,7 +19,7 @@ from stitching import Stitcher
 from stitching.images import Images
 from stitching.seam_finder import SeamFinder
 
-from algorithms.guided_affine import GuidedAffineStitcher
+from algorithms.guided_affine import GuidedAffineStitcher, _matrix3, _points
 from algorithms.seam_mesh import solve_seam_mesh, warp_with_mesh
 from image_io import (
     is_tiff_path,
@@ -112,7 +112,7 @@ class ProgressStitcher(Stitcher):
         if self._uses_guided_geometry():
             self._progress(15.0, "读取人工四角并检测预计重叠区域")
             cameras = self._prepare_guided_geometry(imgs)
-            self._progress(45.0, "完成重叠区匹配与仿射位置修正")
+            self._progress(45.0, "完成重叠区匹配与全局位置修正")
         else:
             self._progress(15.0, "检测特征点")
             if feature_masks is None and self._filename_inputs:
@@ -953,14 +953,19 @@ class GuidedProgressStitcher(ProgressStitcher):
             if (image_a, image_b) not in accepted_pairs:
                 continue
             item_a, item_b = self.items[image_a], self.items[image_b]
-            world_a = (
-                pair["source_points_a"] @ item_a["matrix"][:, :2].T
-                + item_a["matrix"][:, 2]
-            )
-            world_b = (
-                pair["source_points_b"] @ item_b["matrix"][:, :2].T
-                + item_b["matrix"][:, 2]
-            )
+            source_points_a = np.asarray(pair["source_points_a"], dtype=np.float64)
+            source_points_b = np.asarray(pair["source_points_b"], dtype=np.float64)
+            global_inliers = pair.get("global_inliers")
+            if global_inliers is not None:
+                inliers = np.asarray(global_inliers, dtype=bool).reshape(-1)
+                if len(inliers) != len(source_points_a) or len(inliers) != len(source_points_b):
+                    continue
+                source_points_a = source_points_a[inliers]
+                source_points_b = source_points_b[inliers]
+            if not len(source_points_a):
+                continue
+            world_a = _points(item_a["matrix"], source_points_a)
+            world_b = _points(item_b["matrix"], source_points_b)
             constraints.append({
                 "image_a": image_a,
                 "image_b": image_b,
@@ -1002,26 +1007,64 @@ class GuidedProgressStitcher(ProgressStitcher):
         sizes = self.images.get_scaled_img_sizes(resolution)
         corners, warped_sizes = [], []
         for item, size in zip(self.items, sizes):
-            matrix = item["matrix"].copy()
-            matrix[:, :2] *= scale * np.array(item["size"]) / np.array(size)
-            matrix[:, 2] *= scale
-            quad = np.array([[0, 0], [size[0], 0], [size[0], size[1]], [0, size[1]]])
-            # lstsq 的浮点尾差不能把整数边界 -5 误判成 -6。
-            transformed = np.round(quad @ matrix[:, :2].T + matrix[:, 2], 8)
+            matrix = self._guided_matrix(item, size, scale)
+            quad = np.array(
+                [[0, 0], [size[0], 0], [size[0], size[1]], [0, size[1]]],
+                dtype=np.float64,
+            )
+            transformed = np.round(_points(matrix, quad), 8)
+            if not np.isfinite(transformed).all():
+                raise RuntimeError("单应投影产生非有限图像边界")
             low = np.floor(transformed.min(axis=0)).astype(int)
             high = np.ceil(transformed.max(axis=0)).astype(int)
+            warped_size = high - low
+            if min(warped_size) <= 0 or int(warped_size[0]) * int(warped_size[1]) > 500_000_000:
+                raise RuntimeError("单张投影图像尺寸不合理")
             corners.append(tuple(map(int, low)))
-            warped_sizes.append(tuple(map(int, high - low)))
+            warped_sizes.append(tuple(map(int, warped_size)))
+        minimum = np.min(np.asarray(corners), axis=0)
+        maximum = np.max(np.asarray(corners) + np.asarray(warped_sizes), axis=0)
+        canvas_size = maximum - minimum
+        if int(canvas_size[0]) * int(canvas_size[1]) > 500_000_000:
+            raise RuntimeError("单应投影后的全景画布尺寸不合理")
         return corners, warped_sizes
+
+    @staticmethod
+    def _guided_matrix(item, image_size, output_scale, origin=(0, 0)):
+        """Map current-resolution source pixels into the requested canvas."""
+        source_scale = np.asarray(item["size"], dtype=np.float64) / np.asarray(
+            image_size, dtype=np.float64
+        )
+        matrix = np.asarray(item["matrix"], dtype=np.float64)
+        if matrix.shape == (2, 3):
+            result = matrix.copy()
+            result[:, :2] *= output_scale * source_scale
+            result[:, 2] = output_scale * result[:, 2] - np.asarray(origin)
+            return result
+        scaled_source = np.diag([source_scale[0], source_scale[1], 1.0])
+        scaled_output = np.diag([output_scale, output_scale, 1.0])
+        translated_output = np.array(
+            [[1.0, 0.0, -origin[0]], [0.0, 1.0, -origin[1]], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        return translated_output @ scaled_output @ _matrix3(matrix) @ scaled_source
 
     def _guided_warp(self, index, img, mask, resolution, corner, size):
         item = self.items[index]
         scale = self.images._get_scaler(resolution).scale
-        matrix = item["matrix"].copy()
-        matrix[:, :2] *= scale * np.array(item["size"]) / np.array((img.shape[1], img.shape[0]))
-        matrix[:, 2] = scale * matrix[:, 2] - np.array(corner)
-        warped_img = cv2.warpAffine(img, matrix, size, flags=cv2.INTER_LINEAR)
-        warped_mask = cv2.warpAffine(mask, matrix, size, flags=cv2.INTER_NEAREST)
+        matrix = self._guided_matrix(
+            item, (img.shape[1], img.shape[0]), scale, corner
+        )
+        if matrix.shape == (3, 3):
+            warped_img = cv2.warpPerspective(
+                img, matrix, size, flags=cv2.INTER_LINEAR
+            )
+            warped_mask = cv2.warpPerspective(
+                mask, matrix, size, flags=cv2.INTER_NEAREST
+            )
+        else:
+            warped_img = cv2.warpAffine(img, matrix, size, flags=cv2.INTER_LINEAR)
+            warped_mask = cv2.warpAffine(mask, matrix, size, flags=cv2.INTER_NEAREST)
         if (
             resolution == Images.Resolution.FINAL
             and self.mesh_enabled

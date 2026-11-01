@@ -84,6 +84,7 @@
       </div>
       <div class="card">
         <h2>执行拼接</h2>
+        <div class="field"><label for="transform-model">全局几何模型</label><select id="transform-model"><option value="homography" selected>Homography（单应）</option><option value="affine">Affine（仿射）</option></select></div>
         <div class="field"><label for="output-name">输出文件名（保存在 output/）</label><input id="output-name" value="guided_result.jpg"></div>
         <div class="field"><label for="final-megapix">每张图最终分辨率（百万像素）</label><input id="final-megapix" type="number" step="0.1" value="2"></div>
         <div class="field"><label for="blender-type">融合方式</label><select id="blender-type"><option value="multiband" selected>多频段（质量更高）</option><option value="feather">羽化（验证速度快）</option><option value="no">无融合（检查几何位置）</option></select></div>
@@ -545,8 +546,10 @@
     function formatApiDebug(data) {
       const info = data.debug_info;
       if (!info) return '当前 API 未返回阶段调试信息，请确认容器已加载最新代码。';
+      const model = data.transform_model || data.settings?.guided_transform_model || 'unknown';
       const lines = [
         `算法：${data.algorithm}；输入图像：${info.image_count} 张`,
+        `全局几何模型：${model}`,
         `输出：${data.output_width} × ${data.output_height}`,
         `配准状态：${registrationLabel(data.registration_status)}`,
       ];
@@ -554,7 +557,11 @@
         const label = image.status === 'reference' ? '固定参考图' : image.status === 'refined' ? '精配准成功' : '保留人工位置';
         lines.push(`图 ${image.image_index+1}：${label}；${image.reason || ''}`);
         const correction = image.attempted_correction;
-        if (correction) lines.push(`  修正尝试：中心平移 ${(100*correction.translation_ratio).toFixed(2)}% 短边；旋转 ${correction.rotation_degrees.toFixed(2)}°；缩放 ${(100*correction.scale_change).toFixed(2)}%；剪切 ${(100*correction.shear).toFixed(2)}%`);
+        if (correction && model === 'homography') {
+          lines.push(`  修正尝试：最大角点位移 ${correction.max_corner_shift_pixels.toFixed(2)} px；平均角点位移 ${correction.mean_corner_shift_pixels.toFixed(2)} px`);
+        } else if (correction && Number.isFinite(correction.translation_ratio)) {
+          lines.push(`  修正尝试：中心平移 ${(100*correction.translation_ratio).toFixed(2)}% 短边；旋转 ${correction.rotation_degrees.toFixed(2)}°；缩放 ${(100*correction.scale_change).toFixed(2)}%；剪切 ${(100*correction.shear).toFixed(2)}%`);
+        }
       }
       lines.push('', '阶段进度：');
       for (const stage of info.stages || []) {
@@ -646,6 +653,7 @@
                       corners: item.corners.map(p => p.map(number))})),
                     matching_regions: state.regions.map(r => ({id:r.id,rect:[...r.rect]})),
                     output_name: outputName, final_megapix: finalMegapix,
+                    guided_transform_model: $('transform-model').value,
                     blender_type: $('blender-type').value};
       $('run').disabled = true;
       $('status').className = 'muted'; $('status').textContent = '正在调用拼接 API，请等待…';

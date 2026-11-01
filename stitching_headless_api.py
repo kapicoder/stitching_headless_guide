@@ -286,6 +286,7 @@ def _run_headless_stitch(options: Dict[str, Any]) -> Dict[str, Any]:
             response["debug_info"]["pair_diagnostics"] = result_context["pair_diagnostics"]
     if "registration_status" in result_context:
         response["registration_status"] = result_context["registration_status"]
+        response["transform_model"] = result_context["transform_model"]
         response["image_diagnostics"] = result_context["image_diagnostics"]
         response["refinement_limits_enabled"] = result_context[
             "refinement_limits_enabled"
@@ -368,6 +369,7 @@ def _handle_headless_stitching_image() -> Any:
             mesh_settings = {
                 key: response_settings.get(key)
                 for key in (
+                    "guided_transform_model",
                     "guided_mesh_grid_spacing",
                     "guided_mesh_seam_band_ratio",
                     "guided_mesh_max_displacement_ratio",

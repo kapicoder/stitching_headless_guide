@@ -121,6 +121,18 @@ assert.match(debugText, /\[17\/17\] 最终全景图完成/);
 assert.match(debugText, /输出：500 × 900/);
 assert.match(debugText, /状态：已应用网格形变；启用：是；接缝匹配：18；实际应用：是/);
 assert.match(debugText, /图 2：已变形；最大位移 2\.375 px/);
+const homographyDebugText = sandbox.testFormatApiDebug({
+  transform_model: 'homography', registration_status: 'full',
+  image_diagnostics: [{image_index: 1, status: 'refined', attempted_correction: {
+    max_corner_shift_pixels: 15.25, mean_corner_shift_pixels: 9.5,
+  }}],
+  debug_info: {image_count: 2, stages: [], timings: {}, pair_diagnostics: [], seam_mesh: {
+    enabled: true, status: 'fallback_insufficient_seam_matches', matches_used: 3, images: [],
+  }},
+  settings: {guided_transform_model: 'homography', guided_mesh_seam_band_ratio: .25},
+});
+assert.match(homographyDebugText, /全局几何模型：homography/);
+assert.match(homographyDebugText, /最大角点位移 15\.25 px；平均角点位移 9\.50 px/);
 sandbox.testShowProgress();
 assert.equal(element('progress-overlay').hidden, false);
 sandbox.testUpdateProgress({exists: true, percentage: 65, status: '估计曝光补偿'});
@@ -199,18 +211,26 @@ assert.match(rejectedDebug, /中心平移 8.00% 短边/);
 (async () => {
   element('output-name').value = 'result.png';
   element('final-megapix').value = '1';
+  element('transform-model').value = 'homography';
   sandbox.setInterval = () => 1;
   sandbox.clearInterval = () => {};
+  const submittedBodies = [];
   for (const [status, text] of [['full','完整配准'], ['partial','部分配准'], ['manual_only','仅按人工布局合成']]) {
-    sandbox.fetch = async url => ({ok: true, json: async () => url.includes('baseline=1') ? {version: '0'} : {
-      registration_status: status, output_width: 500, output_height: 900,
-      output_path: '/output/result.png', preview_url: '/result/result.png', download_url: '/download/result.png',
-      debug_info: {stages: [], timings: {}, pair_diagnostics: []},
-    }});
+    sandbox.fetch = async (url, options = {}) => {
+      if (url.includes('baseline=1')) return {ok: true, json: async () => ({version: '0'})};
+      submittedBodies.push(JSON.parse(options.body));
+      return {ok: true, json: async () => ({
+        registration_status: status, output_width: 500, output_height: 900,
+        output_path: '/output/result.png', preview_url: '/result/result.png', download_url: '/download/result.png',
+        debug_info: {stages: [], timings: {}, pair_diagnostics: []},
+      })};
+    };
     await element('run').onclick();
     assert.match(element('status').textContent, new RegExp(text));
     assert.equal(element('status').className, status === 'full' ? 'success' : 'muted');
     assert.equal(element('result-panel').style.display, 'block');
   }
+  assert.equal(submittedBodies.length, 3);
+  assert.ok(submittedBodies.every(body => body.guided_transform_model === 'homography'));
   console.log('Registration status, fallback display and pair margins OK');
 })().catch(error => {console.error(error); process.exitCode = 1;});

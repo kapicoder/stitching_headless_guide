@@ -54,7 +54,8 @@ def test_rotation_limit_cannot_exceed_half_turn():
 
 def test_full_affine_micro_correction_preserves_large_initial_rotation_and_scale():
     engine = GuidedAffineStitcher(
-        show_progress=False, guided_refinement_limits_enabled=True
+        show_progress=False, guided_transform_model='affine',
+        guided_refinement_limits_enabled=True
     )
     initial = np.column_stack((1.5 * _rotation(70), [700, -200]))
     correction = _rotation(2) @ np.array([[1.01, 0.01], [0.01, 0.99]])
@@ -76,7 +77,8 @@ def test_full_affine_micro_correction_preserves_large_initial_rotation_and_scale
 ])
 def test_excessive_correction_keeps_exact_initial_matrix(linear, shift, overrides, reason):
     engine = GuidedAffineStitcher(
-        show_progress=False, guided_refinement_limits_enabled=True, **overrides
+        show_progress=False, guided_transform_model='affine',
+        guided_refinement_limits_enabled=True, **overrides
     )
     items = _adjust(engine, linear, shift)
     assert items[1]['correction_status'] == 'fallback_initial'
@@ -85,7 +87,9 @@ def test_excessive_correction_keeps_exact_initial_matrix(linear, shift, override
 
 
 def test_refinement_boundary_is_inclusive():
-    engine = GuidedAffineStitcher(guided_refinement_limits_enabled=True)
+    engine = GuidedAffineStitcher(
+        guided_transform_model='affine', guided_refinement_limits_enabled=True
+    )
     metrics, reason = engine._check_refinement(_rotation(3) @ np.diag([1.03, 0.97]), np.array([9, 0]), 180)
     assert reason == ''
     assert metrics['translation_ratio'] == 0.05
@@ -95,7 +99,8 @@ def test_refinement_boundary_is_inclusive():
 @pytest.mark.parametrize('canvas_scale', [0.5, 1, 3])
 def test_translation_limit_uses_initial_canvas_short_side(canvas_scale):
     engine = GuidedAffineStitcher(
-        show_progress=False, guided_refinement_limits_enabled=True
+        show_progress=False, guided_transform_model='affine',
+        guided_refinement_limits_enabled=True
     )
     initial = np.column_stack((canvas_scale * np.eye(2), [400, 50]))
     items = _adjust(engine, np.eye(2), np.array([8, 0]) * canvas_scale, initial=initial)
@@ -105,7 +110,8 @@ def test_translation_limit_uses_initial_canvas_short_side(canvas_scale):
 
 def test_excessive_bridge_removes_downstream_refinement():
     engine = GuidedAffineStitcher(
-        show_progress=False, guided_refinement_limits_enabled=True
+        show_progress=False, guided_transform_model='affine',
+        guided_refinement_limits_enabled=True
     )
     initial = np.eye(2, 3)
     items = [{'size': (250, 180), 'initial_matrix': initial.copy(), 'matrix': initial.copy(),
@@ -127,7 +133,7 @@ def test_small_shear_and_nonuniform_scale_are_refined(tmp_path):
     corners = np.array([[0, 0], [250, 0], [250, 180], [0, 180]], float)
     initial = np.array([[1.01, 0.01, 172], [0, 0.99, 1]])
     images[1]['corners'] = (corners @ initial[:, :2].T + initial[:, 2]).tolist()
-    engine = GuidedAffineStitcher(show_progress=False)
+    engine = GuidedAffineStitcher(show_progress=False, guided_transform_model="affine")
     items = engine.register(images)
     assert engine.registration_status == 'full'
     transformed = corners @ items[1]['matrix'][:, :2].T + items[1]['matrix'][:, 2]
@@ -135,7 +141,7 @@ def test_small_shear_and_nonuniform_scale_are_refined(tmp_path):
 
 
 def test_refinement_limits_are_disabled_by_default():
-    engine = GuidedAffineStitcher(show_progress=False)
+    engine = GuidedAffineStitcher(show_progress=False, guided_transform_model='affine')
     items = _adjust(engine, np.eye(2), [20, 0])
 
     assert engine.refinement_limits_enabled is False
@@ -151,6 +157,7 @@ def test_api_applies_requested_micro_limits_and_reports_attempt(tmp_path, limit,
         'show_progress': False,
         'settings': {
             'algorithm': 'guided_affine', 'georef_mode': 'none',
+            'guided_transform_model': 'affine',
             'guided_refinement_limits_enabled': True,
             'guided_max_translation_ratio': limit,
         },

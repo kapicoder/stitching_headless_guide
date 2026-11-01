@@ -44,7 +44,7 @@ def test_pair_margin_uses_smaller_transformed_short_side():
 
 @pytest.mark.parametrize('canvas_scale', [0.5, 1, 4])
 def test_ransac_runs_in_target_feature_pixels(monkeypatch, canvas_scale):
-    engine = GuidedAffineStitcher(show_progress=False)
+    engine = GuidedAffineStitcher(show_progress=False, guided_transform_model="affine")
     points_b = np.array([(x, y) for y in (40, 100, 160) for x in (40, 100, 160, 220)], float)
     points_a = points_b + [5, 7]
     points_a[:9] += np.random.default_rng(4).normal(0, 0.5, (9, 2))
@@ -77,7 +77,7 @@ def test_ransac_runs_in_target_feature_pixels(monkeypatch, canvas_scale):
 
 def test_already_aligned_images_are_successfully_registered(tmp_path):
     first, second = _write_pair(tmp_path)
-    engine = GuidedAffineStitcher(show_progress=False)
+    engine = GuidedAffineStitcher(show_progress=False, guided_transform_model="affine")
     items = engine.register(_images(first, second, 170))
     assert engine.registration_status == 'full'
     assert engine.image_diagnostics[0]['status'] == 'reference'

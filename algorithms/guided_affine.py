@@ -16,6 +16,7 @@ from progress import write_progress
 
 GUIDED_DEFAULT_SETTINGS: dict[str, Any] = {
     key: DEFAULT_SETTINGS[key] for key in (
+        "guided_transform_model",
         "guided_min_overlap_pixels", "guided_overlap_margin_ratio",
         "guided_min_inliers", "guided_ransac_threshold_px",
         "guided_refinement_limits_enabled",
@@ -32,6 +33,7 @@ GUIDED_SETTING_KEYS = {
     "detector", "nfeatures", "medium_megapix", "low_megapix",
     "final_megapix", "finder", "compensator", "blender_type",
     "blend_strength", "crop", "guided_min_overlap_pixels",
+    "guided_transform_model",
     "guided_overlap_margin_ratio", "guided_min_inliers",
     "guided_ransac_threshold_px",
     "guided_refinement_limits_enabled",
@@ -112,7 +114,33 @@ def _corners(size: tuple[int, int]) -> np.ndarray:
 
 
 def _points(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    points = np.asarray(points, dtype=np.float64)
+    if matrix.shape == (3, 3):
+        transformed = cv2.perspectiveTransform(points.reshape(1, -1, 2), matrix)
+        return transformed.reshape(-1, 2)
     return points @ matrix[:, :2].T + matrix[:, 2]
+
+
+def _matrix3(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.shape == (3, 3):
+        return matrix.copy()
+    if matrix.shape == (2, 3):
+        return np.vstack((matrix, [0.0, 0.0, 1.0]))
+    raise ValueError("变换矩阵必须是2x3仿射矩阵或3x3单应矩阵")
+
+
+def _normalize_homography(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        raise ValueError("单应矩阵必须是有限的3x3矩阵")
+    scale = matrix[2, 2]
+    if abs(scale) < 1e-12:
+        scale = np.linalg.norm(matrix)
+    if not math.isfinite(float(scale)) or abs(scale) < 1e-12:
+        raise ValueError("单应矩阵尺度无效")
+    return matrix / scale
 
 
 def validate_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -163,6 +191,7 @@ class GuidedAffineStitcher:
         low_megapix=0.3, final_megapix=10, finder="dp_color",
         compensator="channel_blocks", blender_type="multiband",
         blend_strength=1, crop=True,
+        guided_transform_model=GUIDED_DEFAULT_SETTINGS["guided_transform_model"],
         guided_min_overlap_pixels=GUIDED_DEFAULT_SETTINGS["guided_min_overlap_pixels"],
         guided_overlap_margin_ratio=GUIDED_DEFAULT_SETTINGS["guided_overlap_margin_ratio"],
         guided_min_inliers=GUIDED_DEFAULT_SETTINGS["guided_min_inliers"],
@@ -188,11 +217,17 @@ class GuidedAffineStitcher:
         self.blender_type = blender_type
         self.blend_strength = float(blend_strength)
         self.crop = bool(crop)
+        self.transform_model = str(guided_transform_model).strip().lower()
+        if self.transform_model not in {"affine", "homography"}:
+            raise ValueError("guided_transform_model 只支持 affine 或 homography")
         self.min_overlap = int(guided_min_overlap_pixels)
         self.overlap_margin_ratio = float(guided_overlap_margin_ratio)
         self.min_inliers = int(guided_min_inliers)
         self.ransac_threshold_px = float(guided_ransac_threshold_px)
-        self.refinement_limits_enabled = bool(guided_refinement_limits_enabled)
+        self.refinement_limits_enabled = (
+            bool(guided_refinement_limits_enabled)
+            and self.transform_model == "affine"
+        )
         if not math.isfinite(self.ransac_threshold_px) or self.ransac_threshold_px <= 0:
             raise ValueError("guided_ransac_threshold_px 必须是大于0的有限数值")
         self.refinement_limits = {
@@ -409,11 +444,21 @@ class GuidedAffineStitcher:
         if len(pa) < self.min_inliers:
             info["reason"] = "描述子匹配点不足"
             return info, None
-        relative, inlier_mask = cv2.estimateAffine2D(
-            pb, pa, method=cv2.RANSAC, ransacReprojThreshold=self.ransac_threshold_px,
-            maxIters=2000, confidence=0.995,
-        )
-        if relative is None or inlier_mask is None or not self._valid_affine(relative):
+        if self.transform_model == "homography":
+            relative, inlier_mask = cv2.findHomography(
+                pb, pa, method=cv2.RANSAC,
+                ransacReprojThreshold=self.ransac_threshold_px,
+                maxIters=2000, confidence=0.995,
+            )
+            valid_transform = self._valid_homography(relative)
+        else:
+            relative, inlier_mask = cv2.estimateAffine2D(
+                pb, pa, method=cv2.RANSAC,
+                ransacReprojThreshold=self.ransac_threshold_px,
+                maxIters=2000, confidence=0.995,
+            )
+            valid_transform = relative is not None and self._valid_affine(relative)
+        if relative is None or inlier_mask is None or not valid_transform:
             info["reason"] = "RANSAC 估计失败"
             return info, None
         active = inlier_mask.ravel().astype(bool)
@@ -427,11 +472,29 @@ class GuidedAffineStitcher:
             return info, None
         corrected = _points(relative, pb[active])
         info["rmse_pixels"] = float(np.sqrt(np.mean(np.sum((corrected - pa[active]) ** 2, axis=1))))
-        pa *= [a["size"][0] / a["medium"].shape[1], a["size"][1] / a["medium"].shape[0]]
-        pb *= [b["size"][0] / b["medium"].shape[1], b["size"][1] / b["medium"].shape[0]]
+        info["status"] = "matched"
+        scale_a = np.array([
+            a["medium"].shape[1] / a["size"][0],
+            a["medium"].shape[0] / a["size"][1],
+        ])
+        scale_b = np.array([
+            b["medium"].shape[1] / b["size"][0],
+            b["medium"].shape[0] / b["size"][1],
+        ])
+        pa /= scale_a
+        pb /= scale_b
+        if self.transform_model == "homography":
+            medium_from_source_a = np.diag([*scale_a, 1.0])
+            medium_from_source_b = np.diag([*scale_b, 1.0])
+            source_transform = np.linalg.inv(medium_from_source_a) @ relative @ medium_from_source_b
+            return info, {
+                "homography_b_to_a": _normalize_homography(source_transform),
+                "source_points_a": pa,
+                "source_points_b": pb,
+                "inliers": active,
+            }
         world_a = _points(a["matrix"], pa)
         world_b = _points(b["matrix"], pb)
-        info["status"] = "matched"
         return info, (world_a[active], world_b[active])
 
     @staticmethod
@@ -441,6 +504,19 @@ class GuidedAffineStitcher:
         singular = np.linalg.svd(matrix[:, :2], compute_uv=False)
         return bool(np.linalg.det(matrix[:, :2]) > 0
                     and singular[-1] > 1e-8 * singular[0])
+
+    @staticmethod
+    def _valid_homography(matrix: np.ndarray | None) -> bool:
+        if matrix is None or not np.isfinite(matrix).all():
+            return False
+        try:
+            normalized = _normalize_homography(matrix)
+            return bool(
+                np.linalg.matrix_rank(normalized) == 3
+                and np.linalg.cond(normalized) < 1e12
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            return False
 
     @staticmethod
     def _reference_component(pairs: list[tuple], excluded: set[int] | tuple[int, ...] = ()) -> set[int]:
@@ -569,10 +645,99 @@ class GuidedAffineStitcher:
                 items[index].pop("correction_reason", None)
             return
 
+    def _global_homography_adjust(
+        self,
+        items: list[dict],
+        pairs: list[tuple[int, int, np.ndarray, int]],
+    ) -> None:
+        """Propagate accepted pairwise projective transforms from image zero."""
+        items[0]["correction_status"] = "reference"
+        for item in items[1:]:
+            item["correction_reason"] = "没有通过可靠单应匹配连接到第一张参考图"
+
+        adjacency: dict[int, list[tuple[int, np.ndarray, int]]] = {}
+        for image_a, image_b, source_b_to_a, inliers in pairs:
+            initial_a = _matrix3(items[image_a]["initial_matrix"])
+            initial_b = _matrix3(items[image_b]["initial_matrix"])
+            try:
+                canvas_b_to_a = _normalize_homography(
+                    initial_a @ source_b_to_a @ np.linalg.inv(initial_b)
+                )
+                canvas_a_to_b = _normalize_homography(np.linalg.inv(canvas_b_to_a))
+            except (ValueError, np.linalg.LinAlgError):
+                continue
+            if not self._valid_homography(canvas_b_to_a):
+                continue
+            adjacency.setdefault(image_a, []).append((image_b, canvas_b_to_a, inliers))
+            adjacency.setdefault(image_b, []).append((image_a, canvas_a_to_b, inliers))
+        for edges in adjacency.values():
+            edges.sort(key=lambda edge: edge[2], reverse=True)
+
+        global_transforms = {0: np.eye(3, dtype=np.float64)}
+        pending = [0]
+        while pending:
+            current = pending.pop(0)
+            for neighbor, step, _ in adjacency.get(current, []):
+                if neighbor in global_transforms:
+                    continue
+                try:
+                    candidate_global = _normalize_homography(
+                        global_transforms[current] @ step
+                    )
+                    candidate_image = _normalize_homography(
+                        candidate_global @ _matrix3(items[neighbor]["initial_matrix"])
+                    )
+                except (ValueError, np.linalg.LinAlgError):
+                    items[neighbor]["correction_reason"] = "单应矩阵传播失败，保留人工位置"
+                    continue
+                if not self._valid_projective_geometry(
+                    candidate_image, items[neighbor]["size"],
+                ):
+                    items[neighbor]["correction_reason"] = (
+                        "单应变换导致图像边界无效或跨越投影奇点，保留人工位置"
+                    )
+                    continue
+                global_transforms[neighbor] = candidate_global
+                items[neighbor]["matrix"] = candidate_image
+                items[neighbor]["correction_status"] = "refined"
+                initial_quad = _points(
+                    items[neighbor]["initial_matrix"], _corners(items[neighbor]["size"])
+                )
+                final_quad = _points(candidate_image, _corners(items[neighbor]["size"]))
+                corner_shifts = np.linalg.norm(final_quad - initial_quad, axis=1)
+                items[neighbor]["attempted_correction"] = {
+                    "max_corner_shift_pixels": float(corner_shifts.max()),
+                    "mean_corner_shift_pixels": float(corner_shifts.mean()),
+                }
+                items[neighbor].pop("correction_reason", None)
+                pending.append(neighbor)
+
+    @classmethod
+    def _valid_projective_geometry(
+        cls, matrix: np.ndarray, size: tuple[int, int],
+    ) -> bool:
+        if not cls._valid_homography(matrix):
+            return False
+        corners = _corners(size)
+        homogeneous = np.column_stack((corners, np.ones(len(corners)))) @ matrix.T
+        denominators = homogeneous[:, 2]
+        if (np.any(np.abs(denominators) < 1e-8)
+                or np.any(np.sign(denominators) != np.sign(denominators[0]))):
+            return False
+        projected = _points(matrix, corners)
+        if not np.isfinite(projected).all() or np.max(np.abs(projected)) > 1e7:
+            return False
+        contour = projected.astype(np.float32)
+        return bool(
+            cv2.isContourConvex(contour)
+            and cv2.contourArea(contour, oriented=True) > 1.0
+        )
+
     def registration_info(self) -> dict[str, Any]:
         """Return registration quality independently of file-generation success."""
         return {
             "registration_status": self.registration_status,
+            "transform_model": self.transform_model,
             "image_diagnostics": self.image_diagnostics,
             "refinement_limits_enabled": self.refinement_limits_enabled,
             "refinement_limits": self.refinement_limits,
@@ -591,18 +756,34 @@ class GuidedAffineStitcher:
     @staticmethod
     def _warp(item: dict, scale: float, origin: np.ndarray, image: np.ndarray, mask: np.ndarray):
         source_scale = np.array([image.shape[1] / item["size"][0], image.shape[0] / item["size"][1]])
-        matrix = item["matrix"].copy()
-        matrix[:, :2] = scale * matrix[:, :2] / source_scale[np.newaxis, :]
-        matrix[:, 2] = scale * matrix[:, 2] - origin
+        if item["matrix"].shape == (3, 3):
+            source_to_original = np.diag([1 / source_scale[0], 1 / source_scale[1], 1.0])
+            output_scale = np.diag([scale, scale, 1.0])
+            output_origin = np.array(
+                [[1.0, 0.0, -origin[0]], [0.0, 1.0, -origin[1]], [0.0, 0.0, 1.0]]
+            )
+            matrix = output_origin @ output_scale @ item["matrix"] @ source_to_original
+        else:
+            matrix = item["matrix"].copy()
+            matrix[:, :2] = scale * matrix[:, :2] / source_scale[np.newaxis, :]
+            matrix[:, 2] = scale * matrix[:, 2] - origin
         quad = _points(matrix, _corners((image.shape[1], image.shape[0])))
         low = np.floor(quad.min(axis=0)).astype(int)
         high = np.ceil(quad.max(axis=0)).astype(int)
         size = tuple((high - low).astype(int))
         if min(size) <= 0:
             raise RuntimeError("投影后的图像尺寸无效")
-        matrix[:, 2] -= low
-        warped = cv2.warpAffine(image, matrix, size, flags=cv2.INTER_LINEAR)
-        valid = cv2.warpAffine(mask, matrix, size, flags=cv2.INTER_NEAREST)
+        if matrix.shape == (3, 3):
+            translation = np.array(
+                [[1.0, 0.0, -low[0]], [0.0, 1.0, -low[1]], [0.0, 0.0, 1.0]]
+            )
+            matrix = translation @ matrix
+            warped = cv2.warpPerspective(image, matrix, size, flags=cv2.INTER_LINEAR)
+            valid = cv2.warpPerspective(mask, matrix, size, flags=cv2.INTER_NEAREST)
+        else:
+            matrix[:, 2] -= low
+            warped = cv2.warpAffine(image, matrix, size, flags=cv2.INTER_LINEAR)
+            valid = cv2.warpAffine(mask, matrix, size, flags=cv2.INTER_NEAREST)
         return (int(low[0]), int(low[1])), warped, valid
 
     def _read_scaled(self, item: dict, scale: float):
@@ -650,11 +831,13 @@ class GuidedAffineStitcher:
         return blender
 
     def register(self, images: list[dict[str, Any]], medium_images=None) -> list[dict]:
-        """只执行人工仿射约束和重叠区匹配，供原拼接流程复用。"""
+        """Apply the configured global model to matches inside the manual layout."""
         items = validate_images(images)
         self.pair_diagnostics = []
         self.registration_pairs = []
-        self._log("读取特征分辨率图像", 15.0)
+        self._log(
+            f"读取特征分辨率图像（全局模型：{self.transform_model}）", 15.0
+        )
         for index, item in enumerate(items):
             item["initial_matrix"] = item["matrix"].copy()
             scale = self._scale(item["size"], self.medium_megapix)
@@ -664,6 +847,7 @@ class GuidedAffineStitcher:
             item["correction_status"] = "fallback_initial"
         _, norm = self._detector()
         accepted = []
+        homography_pairs = []
         self._log("检测重叠区特征并匹配", 30.0)
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
@@ -679,19 +863,34 @@ class GuidedAffineStitcher:
                                               "search_area_pixels": round(search_area, 2),
                                               "search_margin_pixels": round(margin, 2), **info})
                 if match is not None:
-                    accepted.append((i, j, *match))
-                    inverse_a = cv2.invertAffineTransform(items[i]["initial_matrix"])
-                    inverse_b = cv2.invertAffineTransform(items[j]["initial_matrix"])
-                    self.registration_pairs.append({
-                        "image_a": i,
-                        "image_b": j,
-                        "source_points_a": _points(inverse_a, match[0]),
-                        "source_points_b": _points(inverse_b, match[1]),
-                    })
+                    if self.transform_model == "homography":
+                        homography_pairs.append((
+                            i, j, match["homography_b_to_a"], info["inliers"],
+                        ))
+                        self.registration_pairs.append({
+                            "image_a": i,
+                            "image_b": j,
+                            "source_points_a": match["source_points_a"],
+                            "source_points_b": match["source_points_b"],
+                            "global_inliers": match["inliers"],
+                        })
+                    else:
+                        accepted.append((i, j, *match))
+                        inverse_a = cv2.invertAffineTransform(items[i]["initial_matrix"])
+                        inverse_b = cv2.invertAffineTransform(items[j]["initial_matrix"])
+                        self.registration_pairs.append({
+                            "image_a": i,
+                            "image_b": j,
+                            "source_points_a": _points(inverse_a, match[0]),
+                            "source_points_b": _points(inverse_b, match[1]),
+                        })
         for item in items:
             item.pop("medium")
             item.pop("medium_mask")
-        self._global_adjust(items, accepted)
+        if self.transform_model == "homography":
+            self._global_homography_adjust(items, homography_pairs)
+        else:
+            self._global_adjust(items, accepted)
         self._log("完成全局位置修正", 50.0)
         registered = {index for index, item in enumerate(items)
                       if item["correction_status"] in {"reference", "refined"}}

@@ -19,10 +19,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "nfeatures": 4000,
     # 人工引导配准：外扩距离使用每对图像在画布中的较小短边。
     "guided_min_overlap_pixels": 100,
+    # 人工引导配准的全局模型；homography 适合平面场景并可与接缝 Mesh 组合。
+    "guided_transform_model": "homography",
     "guided_overlap_margin_ratio": 0.10,
     "guided_min_inliers": 8,
     # RANSAC 误差使用目标特征图像素，不使用画布单位。
     "guided_ransac_threshold_px": 3.0,
+    
     # 是否以完整仿射微调幅度拒绝修正；仍保留上限供调试时启用。
     "guided_refinement_limits_enabled": False,
     # 完整仿射微调上限，均相对于用户的初始布局。
@@ -32,7 +35,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 缩放限制极分解的两个主伸缩率，剪切为对称伸缩矩阵的归一化非对角项。
     "guided_max_scale_change": 0.03,
     "guided_max_shear": 0.03,
-    # 接缝局部网格默认关闭；开启后只使用接缝附近的可靠匹配残差。
+    
+    # 接缝局部网格默认开启，使用接缝附近的匹配残差。
     "guided_mesh_enabled": True,
     "guided_mesh_grid_spacing": 128,
     "guided_mesh_seam_band_ratio": 0.25,
@@ -41,14 +45,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "match_conf": 0.65,
     "confidence_threshold": 0.3,
     
-    
+    "compensator": "channel_blocks",
     "matcher_type": "homography",
     "range_width": -1,
     "estimator": "homography",
     "adjuster": "reproj",
     "warper_type": "plane",
     "wave_correct_kind": "no",
-    "compensator": "channel_blocks",
+  
     
     "finder": "dp_color",
     "blender_type": "multiband",
@@ -224,6 +228,11 @@ def build_settings(payload: dict[str, Any]) -> dict[str, Any]:
         settings["guided_refinement_limits_enabled"]
     )
     settings["guided_mesh_enabled"] = _as_bool(settings["guided_mesh_enabled"])
+    settings["guided_transform_model"] = str(
+        settings["guided_transform_model"]
+    ).strip().lower()
+    if settings["guided_transform_model"] not in {"affine", "homography"}:
+        raise ValueError("guided_transform_model 只支持 affine 或 homography")
     settings["georef_mode"] = str(settings["georef_mode"]).strip().lower()
     if settings["georef_mode"] not in {"affine_fit", "copy", "none"}:
         raise ValueError("georef_mode 只支持 affine_fit、copy 或 none")
