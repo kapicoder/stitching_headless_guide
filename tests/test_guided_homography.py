@@ -34,6 +34,30 @@ def test_homography_is_the_guided_default_and_invalid_models_are_rejected():
         })
 
 
+def test_homography_requires_four_minimum_inliers():
+    payload = {
+        "algorithm": "guided_affine",
+        "settings": {
+            "guided_transform_model": "homography",
+            "guided_min_inliers": 3,
+        },
+    }
+    with pytest.raises(ValueError, match="guided_min_inliers 必须至少为4"):
+        build_guided_settings(payload)
+    with pytest.raises(ValueError, match="guided_min_inliers 必须至少为4"):
+        GuidedAffineStitcher(
+            guided_transform_model="homography",
+            guided_min_inliers=3,
+        )
+    assert build_guided_settings({
+        "algorithm": "guided_affine",
+        "settings": {
+            "guided_transform_model": "affine",
+            "guided_min_inliers": 3,
+        },
+    })["guided_min_inliers"] == 3
+
+
 def test_homography_propagation_maps_source_coordinates_to_reference_canvas():
     engine = GuidedAffineStitcher(
         show_progress=False,
@@ -65,6 +89,136 @@ def test_homography_propagation_maps_source_coordinates_to_reference_canvas():
         _points(source_b_to_a, points),
         atol=1e-8,
     )
+
+
+def test_homography_global_adjustment_uses_all_edges_to_close_loops():
+    engine = GuidedAffineStitcher(
+        show_progress=False,
+        guided_transform_model="homography",
+    )
+    items = [
+        {
+            "size": (400, 300),
+            "initial_matrix": np.eye(2, 3, dtype=np.float64),
+            "matrix": np.eye(2, 3, dtype=np.float64),
+            "correction_status": "fallback_initial",
+        }
+        for _ in range(3)
+    ]
+    grid = np.array([
+        (x, y)
+        for y in (20.0, 80.0, 140.0, 200.0)
+        for x in (10.0, 70.0, 130.0, 190.0)
+    ])
+
+    def translation(x):
+        return np.array([
+            [1.0, 0.0, x],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+
+    pairs = []
+    for image_a, image_b, shift, inliers in (
+        (0, 1, 100.0, 100),
+        (1, 2, 100.0, 90),
+        (0, 2, 180.0, 80),
+    ):
+        points_b = grid.copy()
+        points_a = points_b + [shift, 0.0]
+        pairs.append((
+            image_a, image_b, translation(shift), inliers, points_a, points_b,
+        ))
+
+    engine._global_homography_adjust(items, pairs)
+
+    mean_residuals = []
+    for image_a, image_b, _, _, points_a, points_b in pairs:
+        residual = np.linalg.norm(
+            _points(items[image_a]["matrix"], points_a)
+            - _points(items[image_b]["matrix"], points_b),
+            axis=1,
+        )
+        mean_residuals.append(float(residual.mean()))
+    assert all(item["correction_status"] in {"reference", "refined"} for item in items)
+    assert max(mean_residuals) < 10.0
+
+
+def test_homography_registration_passes_inliers_into_global_loop_adjustment(
+    tmp_path, monkeypatch,
+):
+    engine = GuidedAffineStitcher(
+        show_progress=False,
+        guided_transform_model="homography",
+    )
+    image_paths = []
+    image_corners = [[0, 0], [400, 0], [400, 300], [0, 300]]
+    for index in range(3):
+        path = tmp_path / f"loop_{index}.png"
+        assert cv2.imwrite(str(path), np.zeros((300, 400, 3), dtype=np.uint8))
+        image_paths.append(str(path))
+
+    inlier_points_b = np.array([
+        (x, y)
+        for y in (20.0, 80.0, 140.0, 200.0)
+        for x in (10.0, 70.0, 130.0, 190.0)
+    ])
+    outlier_points_b = np.array([
+        (250.0, 30.0), (280.0, 90.0), (310.0, 150.0), (340.0, 210.0),
+    ])
+    points_b = np.concatenate((inlier_points_b, outlier_points_b))
+    shifts = {(0, 1): (100.0, 16), (1, 2): (100.0, 16), (0, 2): (180.0, 16)}
+
+    def fake_match_pair(a, b, _polygon_a, _polygon_b, _norm):
+        image_a = image_paths.index(a["path"])
+        image_b = image_paths.index(b["path"])
+        shift, inlier_count = shifts[(image_a, image_b)]
+        points_a = points_b + [shift, 0.0]
+        points_a[16:] += [45.0, -30.0]
+        homography = np.array([
+            [1.0, 0.0, shift],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        inliers = np.arange(len(points_b)) < inlier_count
+        return (
+            {
+                "status": "matched",
+                "matches": len(points_b),
+                "inliers": inlier_count,
+                "rmse_pixels": 0.0,
+            },
+            {
+                "homography_b_to_a": homography,
+                "source_points_a": points_a,
+                "source_points_b": points_b.copy(),
+                "inliers": inliers,
+            },
+        )
+
+    monkeypatch.setattr(engine, "_match_pair", fake_match_pair)
+    images = [
+        {"path": path, "corners": image_corners}
+        for path in image_paths
+    ]
+
+    items = engine.register(images)
+
+    assert engine.registration_status == "full"
+    assert all(pair["status"] == "refined" for pair in engine.pair_diagnostics)
+    residuals = []
+    for image_a, image_b, (shift, _) in (
+        (0, 1, shifts[(0, 1)]),
+        (1, 2, shifts[(1, 2)]),
+        (0, 2, shifts[(0, 2)]),
+    ):
+        points_a = inlier_points_b + [shift, 0.0]
+        residuals.extend(np.linalg.norm(
+            _points(items[image_a]["matrix"], points_a)
+            - _points(items[image_b]["matrix"], inlier_points_b),
+            axis=1,
+        ))
+    assert max(residuals) < 15.0
 
 
 def test_resolution_scaling_and_roi_translation_preserve_projective_geometry():

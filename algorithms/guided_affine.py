@@ -79,6 +79,9 @@ def build_guided_settings(payload: dict[str, Any]) -> dict[str, Any]:
     result = base.build_settings({"settings": base_values})
     if algorithm != "guided_affine":
         raise ValueError("人工四角配置必须设置 algorithm=guided_affine")
+    if (result["guided_transform_model"] == "homography"
+            and result["guided_min_inliers"] < 4):
+        raise ValueError("guided_transform_model=homography 时 guided_min_inliers 必须至少为4")
     result["algorithm"] = algorithm
     return result
 
@@ -141,6 +144,33 @@ def _normalize_homography(matrix: np.ndarray) -> np.ndarray:
     if not math.isfinite(float(scale)) or abs(scale) < 1e-12:
         raise ValueError("单应矩阵尺度无效")
     return matrix / scale
+
+
+def _projective_projection_jacobian(
+    matrix: np.ndarray, points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    homogeneous = np.column_stack((points, np.ones(len(points)))) @ matrix.T
+    denominator = homogeneous[:, 2]
+    if not np.isfinite(homogeneous).all() or np.any(np.abs(denominator) < 1e-10):
+        return None
+
+    projected = homogeneous[:, :2] / denominator[:, None]
+    x, y = points[:, 0], points[:, 1]
+    u, v = projected[:, 0], projected[:, 1]
+    inverse = 1.0 / denominator
+    jacobian = np.zeros((len(points), 2, 8), dtype=np.float64)
+    jacobian[:, 0, 0] = x * inverse
+    jacobian[:, 0, 1] = y * inverse
+    jacobian[:, 0, 2] = inverse
+    jacobian[:, 0, 6] = -u * x * inverse
+    jacobian[:, 0, 7] = -u * y * inverse
+    jacobian[:, 1, 3] = x * inverse
+    jacobian[:, 1, 4] = y * inverse
+    jacobian[:, 1, 5] = inverse
+    jacobian[:, 1, 6] = -v * x * inverse
+    jacobian[:, 1, 7] = -v * y * inverse
+    return projected, jacobian
 
 
 def validate_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -223,6 +253,12 @@ class GuidedAffineStitcher:
         self.min_overlap = int(guided_min_overlap_pixels)
         self.overlap_margin_ratio = float(guided_overlap_margin_ratio)
         self.min_inliers = int(guided_min_inliers)
+        minimum_inliers = 4 if self.transform_model == "homography" else 3
+        if self.min_inliers < minimum_inliers:
+            raise ValueError(
+                f"guided_transform_model={self.transform_model} 时 "
+                f"guided_min_inliers 必须至少为{minimum_inliers}"
+            )
         self.ransac_threshold_px = float(guided_ransac_threshold_px)
         self.refinement_limits_enabled = (
             bool(guided_refinement_limits_enabled)
@@ -445,11 +481,18 @@ class GuidedAffineStitcher:
             info["reason"] = "描述子匹配点不足"
             return info, None
         if self.transform_model == "homography":
-            relative, inlier_mask = cv2.findHomography(
-                pb, pa, method=cv2.RANSAC,
-                ransacReprojThreshold=self.ransac_threshold_px,
-                maxIters=2000, confidence=0.995,
-            )
+            if len(pa) < 4:
+                info["reason"] = "单应矩阵至少需要4组匹配点"
+                return info, None
+            try:
+                relative, inlier_mask = cv2.findHomography(
+                    pb, pa, method=cv2.RANSAC,
+                    ransacReprojThreshold=self.ransac_threshold_px,
+                    maxIters=2000, confidence=0.995,
+                )
+            except cv2.error:
+                info["reason"] = "RANSAC 单应矩阵估计失败"
+                return info, None
             valid_transform = self._valid_homography(relative)
         else:
             relative, inlier_mask = cv2.estimateAffine2D(
@@ -648,15 +691,17 @@ class GuidedAffineStitcher:
     def _global_homography_adjust(
         self,
         items: list[dict],
-        pairs: list[tuple[int, int, np.ndarray, int]],
+        pairs: list[tuple],
     ) -> None:
-        """Propagate accepted pairwise projective transforms from image zero."""
+        """Initialize from image zero, then fit all accepted pair constraints."""
         items[0]["correction_status"] = "reference"
         for item in items[1:]:
             item["correction_reason"] = "没有通过可靠单应匹配连接到第一张参考图"
 
         adjacency: dict[int, list[tuple[int, np.ndarray, int]]] = {}
-        for image_a, image_b, source_b_to_a, inliers in pairs:
+        accepted_edges = []
+        for pair in pairs:
+            image_a, image_b, source_b_to_a, inliers, *point_data = pair
             initial_a = _matrix3(items[image_a]["initial_matrix"])
             initial_b = _matrix3(items[image_b]["initial_matrix"])
             try:
@@ -670,6 +715,23 @@ class GuidedAffineStitcher:
                 continue
             adjacency.setdefault(image_a, []).append((image_b, canvas_b_to_a, inliers))
             adjacency.setdefault(image_b, []).append((image_a, canvas_a_to_b, inliers))
+            if len(point_data) >= 2:
+                points_a = np.asarray(point_data[0], dtype=np.float64).reshape(-1, 2)
+                points_b = np.asarray(point_data[1], dtype=np.float64).reshape(-1, 2)
+            else:
+                points_b = _corners(items[image_b]["size"])
+                points_a = _points(source_b_to_a, points_b)
+            if len(points_a) != len(points_b):
+                continue
+            finite = np.isfinite(points_a).all(axis=1) & np.isfinite(points_b).all(axis=1)
+            if finite.any():
+                accepted_edges.append({
+                    "image_a": image_a,
+                    "image_b": image_b,
+                    "inliers": max(1, int(inliers)),
+                    "points_a": points_a[finite],
+                    "points_b": points_b[finite],
+                })
         for edges in adjacency.values():
             edges.sort(key=lambda edge: edge[2], reverse=True)
 
@@ -700,17 +762,265 @@ class GuidedAffineStitcher:
                 global_transforms[neighbor] = candidate_global
                 items[neighbor]["matrix"] = candidate_image
                 items[neighbor]["correction_status"] = "refined"
+                items[neighbor].pop("correction_reason", None)
+                pending.append(neighbor)
+
+        connected = set(global_transforms)
+        variables = {index: slot for slot, index in enumerate(sorted(connected - {0}))}
+        if not variables:
+            return
+
+        def record_correction_metrics():
+            for index in variables:
                 initial_quad = _points(
-                    items[neighbor]["initial_matrix"], _corners(items[neighbor]["size"])
+                    items[index]["initial_matrix"], _corners(items[index]["size"])
                 )
-                final_quad = _points(candidate_image, _corners(items[neighbor]["size"]))
+                final_quad = _points(
+                    items[index]["matrix"], _corners(items[index]["size"])
+                )
                 corner_shifts = np.linalg.norm(final_quad - initial_quad, axis=1)
-                items[neighbor]["attempted_correction"] = {
+                items[index]["attempted_correction"] = {
                     "max_corner_shift_pixels": float(corner_shifts.max()),
                     "mean_corner_shift_pixels": float(corner_shifts.mean()),
                 }
-                items[neighbor].pop("correction_reason", None)
-                pending.append(neighbor)
+
+        seed_matrices = {
+            index: _matrix3(items[index]["matrix"]).copy()
+            for index in connected
+        }
+        seed_quads = [
+            _points(seed_matrices[index], _corners(items[index]["size"]))
+            for index in connected
+        ]
+        all_corners = np.concatenate(seed_quads)
+        canvas_center = (all_corners.min(axis=0) + all_corners.max(axis=0)) * 0.5
+        image_spans = [
+            float(np.linalg.norm(
+                np.roll(quad, -1, axis=0) - quad, axis=1
+            ).max())
+            for quad in seed_quads
+        ]
+        canvas_unit = max(float(np.median(image_spans)), 1.0)
+        canvas_normalize = np.array([
+            [1.0 / canvas_unit, 0.0, -canvas_center[0] / canvas_unit],
+            [0.0, 1.0 / canvas_unit, -canvas_center[1] / canvas_unit],
+            [0.0, 0.0, 1.0],
+        ])
+        canvas_denormalize = np.linalg.inv(canvas_normalize)
+        source_normalize = {}
+        source_denormalize = {}
+        seed_projective = {}
+        for index in connected:
+            width, height = items[index]["size"]
+            source_unit = max(width, height) * 0.5
+            source_normalize[index] = np.array([
+                [1.0 / source_unit, 0.0, -width * 0.5 / source_unit],
+                [0.0, 1.0 / source_unit, -height * 0.5 / source_unit],
+                [0.0, 0.0, 1.0],
+            ])
+            source_denormalize[index] = np.linalg.inv(source_normalize[index])
+            seed_projective[index] = _normalize_homography(
+                canvas_normalize
+                @ seed_matrices[index]
+                @ source_denormalize[index]
+            )
+            if abs(seed_projective[index][2, 2]) < 1e-8:
+                record_correction_metrics()
+                return
+            seed_projective[index] /= seed_projective[index][2, 2]
+
+        edge_count = max(len(accepted_edges), 1)
+        point_limit = max(4, min(200, 3000 // edge_count))
+        inlier_median = max(
+            float(np.median([edge["inliers"] for edge in accepted_edges])), 1.0
+        ) if accepted_edges else 1.0
+        observations = []
+        for edge in accepted_edges:
+            image_a, image_b = edge["image_a"], edge["image_b"]
+            if image_a not in connected or image_b not in connected:
+                continue
+            points_a, points_b = edge["points_a"], edge["points_b"]
+            if len(points_a) > point_limit:
+                sample = np.linspace(0, len(points_a) - 1, point_limit, dtype=int)
+                points_a, points_b = points_a[sample], points_b[sample]
+            if len(points_a) < 4:
+                continue
+            observations.append({
+                "image_a": image_a,
+                "image_b": image_b,
+                "points_a": _points(source_normalize[image_a], points_a),
+                "points_b": _points(source_normalize[image_b], points_b),
+                "weight": float(np.clip(edge["inliers"] / inlier_median, 0.25, 4.0)),
+            })
+        if not observations:
+            record_correction_metrics()
+            return
+
+        variable_count = 8 * len(variables)
+        parameters = np.zeros(variable_count, dtype=np.float64)
+        for index, slot in variables.items():
+            matrix = seed_projective[index]
+            parameters[8 * slot:8 * (slot + 1)] = (
+                matrix[0, 0], matrix[0, 1], matrix[0, 2],
+                matrix[1, 0], matrix[1, 1], matrix[1, 2],
+                matrix[2, 0], matrix[2, 1],
+            )
+
+        def unpack(values):
+            matrices = {0: seed_projective[0]}
+            for index, slot in variables.items():
+                block = values[8 * slot:8 * (slot + 1)]
+                matrices[index] = np.array([
+                    [block[0], block[1], block[2]],
+                    [block[3], block[4], block[5]],
+                    [block[6], block[7], 1.0],
+                ])
+            return matrices
+
+        minimum_scale = min(
+            self._scale(items[index]["size"], self.medium_megapix)
+            for index in connected
+        )
+        huber_delta = max(
+            1e-4,
+            2.0 * self.ransac_threshold_px
+            / max(minimum_scale * canvas_unit, 1e-9),
+        )
+        prior_weight = 0.01
+        prior_points = {
+            index: _points(source_normalize[index], _corners(items[index]["size"]))
+            for index in variables
+        }
+        prior_targets = {
+            index: _points(seed_projective[index], prior_points[index])
+            for index in variables
+        }
+
+        def build_system(values, with_normal):
+            matrices = unpack(values)
+            normal = np.zeros((variable_count, variable_count)) if with_normal else None
+            gradient = np.zeros(variable_count) if with_normal else None
+            cost = 0.0
+            for observation in observations:
+                image_a, image_b = observation["image_a"], observation["image_b"]
+                points_a, points_b = observation["points_a"], observation["points_b"]
+                projected_a = _projective_projection_jacobian(
+                    matrices[image_a], points_a,
+                )
+                projected_b = _projective_projection_jacobian(
+                    matrices[image_b], points_b,
+                )
+                if projected_a is None or projected_b is None:
+                    return None, None, math.inf
+                result_a, jacobian_a = projected_a
+                result_b, jacobian_b = projected_b
+                residual = result_a - result_b
+                lengths = np.linalg.norm(residual, axis=1)
+                robust = np.minimum(1.0, huber_delta / np.maximum(lengths, 1e-12))
+                weight = observation["weight"]
+                rho = np.where(
+                    lengths <= huber_delta,
+                    0.5 * lengths * lengths,
+                    huber_delta * (lengths - 0.5 * huber_delta),
+                )
+                cost += weight * float(rho.sum())
+                if not with_normal:
+                    continue
+                row_weight = np.sqrt(weight * robust)
+                weighted_residual = (residual * row_weight[:, None]).reshape(-1)
+                blocks = []
+                for image_index, jacobian, sign in (
+                    (image_a, jacobian_a, 1.0),
+                    (image_b, jacobian_b, -1.0),
+                ):
+                    if image_index not in variables:
+                        continue
+                    slot = variables[image_index]
+                    block = (
+                        sign * jacobian * row_weight[:, None, None]
+                    ).reshape(-1, 8)
+                    section = slice(8 * slot, 8 * (slot + 1))
+                    normal[section, section] += block.T @ block
+                    gradient[section] += block.T @ weighted_residual
+                    blocks.append((section, block))
+                if len(blocks) == 2:
+                    (section_a, block_a), (section_b, block_b) = blocks
+                    cross = block_a.T @ block_b
+                    normal[section_a, section_b] += cross
+                    normal[section_b, section_a] += cross.T
+
+            for image_index, slot in variables.items():
+                projected = _projective_projection_jacobian(
+                    matrices[image_index], prior_points[image_index],
+                )
+                if projected is None:
+                    return None, None, math.inf
+                current, jacobian = projected
+                residual = (current - prior_targets[image_index]) * prior_weight
+                cost += 0.5 * float(np.sum(residual * residual))
+                if with_normal:
+                    block = (jacobian * prior_weight).reshape(-1, 8)
+                    weighted_residual = residual.reshape(-1)
+                    section = slice(8 * slot, 8 * (slot + 1))
+                    normal[section, section] += block.T @ block
+                    gradient[section] += block.T @ weighted_residual
+            return normal, gradient, cost
+
+        def valid_candidate(values):
+            matrices = unpack(values)
+            result = {}
+            for index in variables:
+                try:
+                    matrix = _normalize_homography(
+                        canvas_denormalize
+                        @ matrices[index]
+                        @ source_normalize[index]
+                    )
+                except (ValueError, np.linalg.LinAlgError):
+                    return None
+                if not self._valid_projective_geometry(matrix, items[index]["size"]):
+                    return None
+                result[index] = matrix
+            return result
+
+        damping = 1e-4
+        for _ in range(25):
+            normal, gradient, cost = build_system(parameters, True)
+            if normal is None or not math.isfinite(cost):
+                break
+            diagonal = np.maximum(np.diag(normal), 1e-8)
+            try:
+                step = np.linalg.solve(
+                    normal + damping * np.diag(diagonal), -gradient,
+                )
+            except np.linalg.LinAlgError:
+                break
+            if not np.isfinite(step).all() or np.linalg.norm(step) < 1e-9:
+                break
+            accepted = False
+            for backtrack in range(8):
+                candidate = parameters + step * (0.5 ** backtrack)
+                matrices = valid_candidate(candidate)
+                if matrices is None:
+                    continue
+                _, _, candidate_cost = build_system(candidate, False)
+                if candidate_cost < cost - max(1e-12, cost * 1e-10):
+                    parameters = candidate
+                    damping = max(damping / 3.0, 1e-8)
+                    accepted = True
+                    break
+            if not accepted:
+                damping *= 10.0
+                if damping > 1e8:
+                    break
+
+        optimized = valid_candidate(parameters)
+        if optimized is None:
+            record_correction_metrics()
+            return
+        for index, matrix in optimized.items():
+            items[index]["matrix"] = matrix
+        record_correction_metrics()
 
     @classmethod
     def _valid_projective_geometry(
@@ -866,6 +1176,8 @@ class GuidedAffineStitcher:
                     if self.transform_model == "homography":
                         homography_pairs.append((
                             i, j, match["homography_b_to_a"], info["inliers"],
+                            match["source_points_a"][match["inliers"]],
+                            match["source_points_b"][match["inliers"]],
                         ))
                         self.registration_pairs.append({
                             "image_a": i,
